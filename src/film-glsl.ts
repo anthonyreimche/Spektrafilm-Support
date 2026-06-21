@@ -73,7 +73,9 @@ export const FILM_GLSL = `
   vec3 sfXyz = sf_apply(max(lin, 0.0) * exp2(sfExposure), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
   float sfB = max(sfXyz.x + sfXyz.y + sfXyz.z, 1e-10);
   vec2 sfTc = sf_tri2quad(sfXyz.xy / sfB);
-  vec3 sfRaw = texture(filmTc, sfTc).rgb * sfB;
+  // filmTc is row-major tc_lut[i=tc.x][j=tc.y]; texture() maps .x→column/.y→row,
+  // so sample at .yx to hit tc_lut[i=tc.x][j=tc.y] (not the transpose).
+  vec3 sfRaw = texture(filmTc, sfTc.yx).rgb * sfB;
   vec3 sfLogf = log2(max(sfRaw, 0.0) + 1e-10) * 0.301029996;   // log10
 
   // ── Stage 2: develop (curves + DIR couplers) ──

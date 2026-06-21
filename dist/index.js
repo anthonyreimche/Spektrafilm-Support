@@ -45,7 +45,9 @@ vec3 sf_gamut_compress(vec3 rgb) {
   vec3 sfXyz = sf_apply(max(lin, 0.0) * exp2(sfExposure), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
   float sfB = max(sfXyz.x + sfXyz.y + sfXyz.z, 1e-10);
   vec2 sfTc = sf_tri2quad(sfXyz.xy / sfB);
-  vec3 sfRaw = texture(filmTc, sfTc).rgb * sfB;
+  // filmTc is row-major tc_lut[i=tc.x][j=tc.y]; texture() maps .x→column/.y→row,
+  // so sample at .yx to hit tc_lut[i=tc.x][j=tc.y] (not the transpose).
+  vec3 sfRaw = texture(filmTc, sfTc.yx).rgb * sfB;
   vec3 sfLogf = log2(max(sfRaw, 0.0) + 1e-10) * 0.301029996;   // log10
 
   // ── Stage 2: develop (curves + DIR couplers) ──
@@ -254,14 +256,14 @@ function R(A) {
     glsl: H
   };
 }
-let E = null, K = 1, j = null;
+let E = null, h = 1, j = null;
 function I(A, Q) {
   const B = k.find((T) => T.id === Q) ?? k[0];
   A.registerProcessingStage(R(B));
-  const z = ++K;
+  const z = ++h;
   A.setStageTexture(C, "filmTc", { data: B.filmTc(), width: B.tcSize, height: B.tcSize, format: "rgba16f", version: z }), A.setStageTexture(C, "filmCurves", { data: B.filmCurves(), width: 256, height: 3, format: "rgba16f", version: z }), A.setStageTexture(C, "filmSpec", { data: B.filmSpec(), width: 81, height: 4, format: "rgba16f", version: z });
 }
-function h(A) {
+function K(A) {
   A.stores.useDevelopStore.getState().setDynParams({
     [`${C}.sfExposure`]: 0,
     [`${C}.sfPrintExp`]: 1
@@ -322,7 +324,7 @@ function G(A) {
     title: "Spektrafilm",
     component: B,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
-    onReset: () => h(A)
+    onReset: () => K(A)
   });
 }
 function p() {
