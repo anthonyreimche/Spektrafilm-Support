@@ -11,8 +11,9 @@
 //
 // The film transform runs at the `tone-map` phase on scene-linear `lin` and
 // writes scene-linear print colour, which SafeLight's display transform then
-// encodes — so pick the default ("Linear") rendering transform, not AgX/ACES,
-// to avoid a second tone map on top of the film.
+// encodes. The extension registers a matching "Spektrafilm" display transform
+// (plain encode, base curve off) — select it in Preferences ▸ Rendering so the
+// film isn't tone-mapped a second time by AgX/ACES.
 
 import {
   ATLAS_W,
@@ -71,11 +72,21 @@ interface StageTextureData {
   version: number;
 }
 
+interface PipelineContribution {
+  id: string;
+  name: string;
+  description?: string;
+  /** Body defining `vec3 pipelineToDisplay(vec3 lin)`. */
+  glsl?: string;
+  skipBaseCurve?: boolean;
+}
+
 interface SafelightAPI {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   react: any;
   registerProcessingStage(c: ProcessingStageContribution): void;
   setStageTexture(stageId: string, key: string, tex: StageTextureData | null): void;
+  registerPipeline(c: PipelineContribution): void;
   registerPanel(c: {
     id: string;
     title: string;
@@ -206,6 +217,21 @@ export function activate(api: SafelightAPI): void {
   const React = api.react;
 
   api.registerProcessingStage(FILM_STAGE);
+
+  // Display transform to pair with the film stage. The film stock IS the tone
+  // rendering, so the correct view transform is a plain encode with NO extra
+  // tone map (not AgX/ACES) and the RAW base contrast curve OFF (skipBaseCurve)
+  // — so the stage receives clean scene-linear. Select "Spektrafilm" in
+  // Preferences ▸ Rendering when using the film stocks.
+  api.registerPipeline({
+    id: "spektrafilm-support.transform",
+    name: "Spektrafilm",
+    description:
+      "Plain sRGB encode with the RAW base curve off — the correct view transform for Spektrafilm film stocks (the film provides the tone rendering). Avoids a second tone map on top of the film.",
+    glsl: "vec3 pipelineToDisplay(vec3 lin) { return linearToSrgbU(lin); }",
+    skipBaseCurve: true,
+  });
+
   uploadStock(api, api.settings.get("stock", STOCKS[0].id));
 
   function SpektrafilmPanel() {

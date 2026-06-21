@@ -84,7 +84,11 @@ function atlasFromCube(cube, file) {
 
 const clamp8 = (v) => Math.max(0, Math.min(255, Math.round(v * 255)));
 const prettyName = (id) =>
-  id.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  id
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    // Uppercase a stock-letter that trails a number (400h → 400H, 250d → 250D).
+    .replace(/(\d)([a-z])/g, (_, d, l) => d + l.toUpperCase());
 
 const args = process.argv.slice(2);
 if (args.length === 0) {
