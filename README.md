@@ -18,7 +18,7 @@ print. None of that runs per frame here.
 
 - **The colour core is baked offline into a 3D LUT** (`tools/bake_luts.py`) and
   uploaded to the GPU once per stock. The per-frame hot path is a single
-  tiled-atlas trilinear lookup over a log-shaped input — trivially real-time.
+  tiled-atlas trilinear lookup over an sRGB-encoded input — trivially real-time.
 - **Switching stocks swaps the LUT texture**, not the shader — no recompile.
 - **Halation** is one downsampled separable-blur prepass (only when its amount is
   non-zero). **Grain** is a few ALU ops per pixel.
@@ -33,18 +33,43 @@ scene-linear print colour, which SafeLight's display transform then encodes.
 ## Baking real film stocks
 
 Out of the box this ships with a single **neutral placeholder** LUT (the image
-renders normally). Real stocks come from running the Spektrafilm engine offline:
+renders normally). Real stocks come from Spektrafilm's own LUT baker, run
+offline. SafeLight never links the GPLv3 engine — it only loads the baked LUT
+bytes.
+
+**1. Install Spektrafilm** (its deps are heavy — OpenImageIO, rawpy, numba… — so
+a conda/mamba env is recommended) from <https://github.com/andreavolpato/spektrafilm>.
+List what's available:
 
 ```bash
-# Requires a working Spektrafilm install + numpy.
-# 1. Edit STOCKS and wire render_with_spektrafilm() in tools/bake_luts.py.
-python tools/bake_luts.py        # writes src/stocks.generated.ts
-npm run build                    # bundles the baked LUTs into dist/index.js
+spektrafilm-lut list film     # e.g. kodak_portra_400, kodak_ektar_100, …
+spektrafilm-lut list print    # e.g. kodak_portra_endura, kodak_2383, …
 ```
 
-`bake_luts.py` is the **only** place the GPLv3 Spektrafilm engine is touched — it
-runs the simulation on a grid and writes the result as data. SafeLight never
-links the engine; it only loads the baked bytes.
+**2. Bake each stock as a 33³ .cube with sRGB input + output** (this is what the
+extension's shader expects):
+
+```bash
+spektrafilm-lut build --film kodak_portra_400 --print kodak_portra_endura \
+  --input srgb --output srgb --resolution 33 --out ./baked
+# repeat for each film/print combination you want
+```
+
+> **Input/output must be `srgb` and resolution `33`** — the shader sRGB-encodes
+> the scene-linear input before the lookup and the atlas is fixed at 33³. Other
+> encodings/sizes won't line up. (A log input like V-Log could preserve more
+> highlight latitude later, but needs a matching shaper change + calibration.)
+
+**3. Convert the .cube bundles to the extension's atlas** and rebuild:
+
+```bash
+node tools/cube_to_stocks.mjs ./baked   # → src/stocks.generated.ts
+npm run build                           # bundles the LUTs into dist/index.js
+```
+
+Each `.cube` becomes one stock (id = filename, name = prettified). Rename the
+`.cube` files first if you want friendlier names in the picker. Commit
+`dist/index.js` and `src/stocks.generated.ts`, then install/reload.
 
 ## Installation
 

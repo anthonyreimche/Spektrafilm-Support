@@ -4,9 +4,10 @@
 // (https://github.com/andreavolpato/spektrafilm) into SafeLight as a real-time
 // GPU stage. The expensive part — reconstructing a spectrum per pixel, exposing
 // a virtual emulsion, developing dye densities, printing and scanning — is NOT
-// done per frame. It is baked offline into a 3D LUT (tools/bake_luts.py) and
-// uploaded to a processing stage as a texture. The per-frame hot path is then a
-// single tetrahedral LUT lookup + an optional halation prepass + grain.
+// done per frame. It is baked offline into a 3D LUT by Spektrafilm's own
+// `spektrafilm-lut` CLI (.cube), converted to an atlas by tools/cube_to_stocks.mjs,
+// and uploaded to a processing stage as a texture. The per-frame hot path is
+// then a single tetrahedral LUT lookup + an optional halation prepass + grain.
 //
 // The film transform runs at the `tone-map` phase on scene-linear `lin` and
 // writes scene-linear print colour, which SafeLight's display transform then
@@ -133,13 +134,14 @@ const HALATION_PASS: StagePass = {
 };
 
 // Inline film transform on scene-linear `lin`. Print Exposure scales the input;
-// the shaper maps it into the LUT domain; the LUT output (sRGB-encoded print
-// colour, for 8-bit precision) is decoded back to linear so SafeLight's display
-// transform encodes it once. Halation adds the blurred highlight mask, tinted
-// red-orange; grain is a luminance-neutral multiplicative dither.
+// linearToSrgb encodes it into the LUT's sRGB input domain (clamping to [0,1]);
+// the LUT output (sRGB-encoded print colour, for 8-bit precision) is decoded
+// back to linear so SafeLight's display transform encodes it once. Halation adds
+// the blurred highlight mask, tinted red-orange; grain is a luminance-neutral
+// multiplicative dither.
 const FILM_GLSL = `
   vec3 linExp = lin * exp2(exposure);
-  vec3 film = srgbToLinear(sfSampleLut(filmLut, sfShaper(linExp), cubeSize));
+  vec3 film = srgbToLinear(sfSampleLut(filmLut, linearToSrgb(linExp), cubeSize));
   film += stageResult * vec3(1.0, 0.4, 0.15) * halation;
   float noise = (sfHash(srcUv * vec2(1543.0, 2087.0)) - 0.5) * grain * 0.08;
   lin = max(film * (1.0 + noise), vec3(0.0));
