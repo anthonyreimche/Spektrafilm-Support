@@ -10,14 +10,15 @@
 //   filmTc   : 64×64  rgb   — Hanatos chromaticity LUT (film raw layers)
 //   filmCurves: 256×3 rgb   — row0 norm_dc, row1 dc0(before-couplers), row2 morphed print curves
 //   filmSpec : 81×4   rgba  — row0 (chD_film.rgb, baseD_film)
-//                             row1 (printKernel.rgb=filt×paperSens, _)
+//                             row1 (printKernel.rgb=filt×paperSens, dichroicM)
 //                             row2 (chD_print.rgb, baseD_print)
-//                             row3 (scanKernel.rgb=scanIllum×CMF, _)
+//                             row3 (scanKernel.rgb=scanIllum×CMF, dichroicY)
 //
 // Per-stock uniforms (vec3 columns since mat3 isn't param-bag bindable):
 //   sfRgb2xyz0..2, sfCoup0..2, sfXyz2rgb0..2  (matrix columns)
-//   sfFactor, sfScanNorm, sfLeFilm(vec2 lo/hi), sfLePrint(vec2 lo/hi)
-// Live uniforms: sfExposure, sfPrintExp, sfGamma.
+//   sfFactor, sfScanNorm, sfLeFilm(vec2 lo/hi), sfLePrint(vec2 lo/hi),
+//   sfNeutralMY(vec2 neutral CC for M/Y)
+// Live uniforms: sfExposure, sfPrintExp, sfCouplerAmt, sfContrast, sfFiltM, sfFiltY.
 
 export const N_WL = 81;
 
@@ -79,22 +80,52 @@ export const FILM_GLSL = `
   vec3 sfLogf = log2(max(sfRaw, 0.0) + 1e-10) * 0.301029996;   // log10
 
   // ── Stage 2: develop (curves + DIR couplers) ──
+  // sfCouplerAmt scales the DIR-coupler cross-talk (1.0 = engine default, 0 =
+  // couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
   vec3 sfDens = sf_curve(filmCurves, 0.0, sfLeFilm, sfLogf);             // norm_dc
-  vec3 sfLog0 = sfLogf - sf_apply(sfDens, sfCoup0, sfCoup1, sfCoup2);
+  vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfDens, sfCoup0, sfCoup1, sfCoup2);
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
   // ── Stage 3: print-expose (81-bin spectral) ──
+  // Live enlarger filtration is active ONLY when the stock bundle ships the
+  // neutral filter pack + dichroic spectra — a re-extraction that #defines
+  // SF_HAS_NEUTRAL (see extract_stock.py). Without it the stage compiles to the
+  // plain neutral kernel (identical to before), so old bundles keep working.
+  // When present: re-balance the baked neutral print kernel by the live/neutral
+  // ratio of the M and Y dichroic dimming factors (C held, as on a real colour
+  // head). dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the
+  // wavelength-independent t terms hoist out; M/Y dichroic spectra ride in the
+  // print/scan kernel alpha lanes.
+#ifdef SF_HAS_NEUTRAL
+  float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
+  float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
+  float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
+  float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
+#endif
   vec3 sfRawP = vec3(0.0);
   for (int i = 0; i < ${N_WL}; i++) {
     float u = (float(i) + 0.5) / float(${N_WL});
     vec4 fs = texture(filmSpec, vec2(u, 0.125));                         // row0 chD_film+baseD
     float dspec = dot(sfCmyF, fs.rgb) + fs.a;
-    sfRawP += sf_pow10neg(dspec) * texture(filmSpec, vec2(u, 0.375)).rgb; // row1 printKernel
+    vec4 pk = texture(filmSpec, vec2(u, 0.375));                         // row1 printKernel.rgb + dichM(a)
+#ifdef SF_HAS_NEUTRAL
+    float dichY = texture(filmSpec, vec2(u, 0.875)).a;                   // row3 scanKernel.rgb + dichY(a)
+    float ratioM = (1.0 - (1.0 - pk.a) * (1.0 - sfTmL)) / (1.0 - (1.0 - pk.a) * (1.0 - sfTmN));
+    float ratioY = (1.0 - (1.0 - dichY) * (1.0 - sfTyL)) / (1.0 - (1.0 - dichY) * (1.0 - sfTyN));
+    sfRawP += sf_pow10neg(dspec) * pk.rgb * (ratioM * ratioY);
+#else
+    sfRawP += sf_pow10neg(dspec) * pk.rgb;
+#endif
   }
   sfRawP *= sfFactor * sfPrintExp;
   vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
 
   // ── Stage 4: print-develop ──
+  // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
+  // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
+  // mid-grey put while steepening/flattening the toe and shoulder.
+  float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
+  sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
   vec3 sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);            // morphed print
 
   // ── Stage 5: scan (81-bin spectral → XYZ → RGB) ──

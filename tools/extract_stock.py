@@ -22,6 +22,7 @@ from spektrafilm.runtime.topology import Tap
 from spektrafilm.config import STANDARD_OBSERVER_CMFS
 from spektrafilm.model.illuminants import standard_illuminant
 from spektrafilm.model.couplers import compute_dir_couplers_matrix, compute_density_curves_before_dir_couplers
+from spektrafilm.model.color_filters import custom_dichroic_filters
 from spektrafilm.utils.morph_curves import apply_print_curves_morph
 from spektrafilm.utils.spectral_upsampling import _illuminant_to_xy
 
@@ -83,6 +84,15 @@ def extract(film, prnt):
     psens = np.nan_to_num(10.0 ** np.asarray(pd.log_sensitivity))
     pkern = filt[:, None] * psens
     factor = float(np.asarray(pipe._printing_stage._compute_exposure_factor_midgray(psens, filt)).reshape(-1)[0])
+    # Enlarger dichroic M/Y spectra + the stock's neutral filter pack, so the
+    # shader can recompute filtration LIVE relative to neutral (C held, as on a
+    # real colour head). custom_dichroic_filters.filters columns are C,M,Y; the
+    # baked pkern already carries the neutral pack, so we only ship what's needed
+    # to form the live/neutral dimming ratio. Packed into the spare alpha lanes
+    # of the print/scan kernels (filmSpec row1.a = dichM, row3.a = dichY).
+    dich = np.asarray(custom_dichroic_filters.filters)
+    dichM = dich[:, 1]; dichY = dich[:, 2]
+    neutralMY = [float(p.enlarger.m_filter_neutral), float(p.enlarger.y_filter_neutral)]
 
     le_p = np.asarray(pd.log_exposure)
     morph = np.asarray(apply_print_curves_morph(le_p, pd.density_curves_model, p.print_render.density_curves_morph, profile_type=p.print.info.type))
@@ -99,9 +109,9 @@ def extract(film, prnt):
     filmCurves[0, :, :3] = norm_dc; filmCurves[1, :, :3] = dc0; filmCurves[2, :, :3] = morph
     filmSpec = np.zeros((4, NWL, 4), np.float32)
     filmSpec[0, :, :3] = chD_f; filmSpec[0, :, 3] = bD_f
-    filmSpec[1, :, :3] = pkern
+    filmSpec[1, :, :3] = pkern; filmSpec[1, :, 3] = dichM
     filmSpec[2, :, :3] = chD_p; filmSpec[2, :, 3] = bD_p
-    filmSpec[3, :, :3] = skern
+    filmSpec[3, :, :3] = skern; filmSpec[3, :, 3] = dichY
 
     def col(M, j): return [float(M[0, j]), float(M[1, j]), float(M[2, j])]
     consts = {
@@ -111,6 +121,7 @@ def extract(film, prnt):
         "factor": factor, "scanNorm": snorm,
         "leFilm": [float(le_f[0]), float(le_f[-1])],
         "lePrint": [float(le_p[0]), float(le_p[-1])],
+        "neutralMY": neutralMY,
     }
     return pipe, p, dict(filmTc=filmTc, filmCurves=filmCurves, filmSpec=filmSpec, consts=consts)
 
@@ -155,13 +166,17 @@ def _vec3(v): return f"vec3({v[0]:.8g},{v[1]:.8g},{v[2]:.8g})"
 
 
 def _const_block(c):
-    L = []
+    # Signals to the shader that this bundle carries the neutral filter pack +
+    # dichroic spectra, enabling the live enlarger-filtration path (#ifdef guard
+    # in film-glsl.ts). Older bundles lack it and compile the plain neutral path.
+    L = ["#define SF_HAS_NEUTRAL"]
     for nm, key in (("sfRgb2xyz", "rgb2xyz"), ("sfCoup", "coup"), ("sfXyz2rgb", "xyz2rgb")):
         for j in range(3): L.append(f"const vec3 {nm}{j} = {_vec3(c[key][j])};")
     L.append(f"const float sfFactor = {c['factor']:.8g};")
     L.append(f"const float sfScanNorm = {c['scanNorm']:.8g};")
     L.append(f"const vec2 sfLeFilm = vec2({c['leFilm'][0]:.8g},{c['leFilm'][1]:.8g});")
     L.append(f"const vec2 sfLePrint = vec2({c['lePrint'][0]:.8g},{c['lePrint'][1]:.8g});")
+    L.append(f"const vec2 sfNeutralMY = vec2({c['neutralMY'][0]:.8g},{c['neutralMY'][1]:.8g});")
     return "\\n".join(L)
 
 
