@@ -3,7 +3,7 @@
 	"name": "Spektrafilm Support",
 	"version": "2.0.0",
 	"description": "Real-time spectral film simulation — the Spektrafilm look as a baked-LUT GPU stage, with halation and grain.",
-	"author": "SafeLight",
+	"author": "Anthony Reimche",
 	"main": "dist/index.js",
 	"license": "GPL-3.0-or-later",
 	"categories": ["Color"],
