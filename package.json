@@ -1,7 +1,7 @@
 {
   "name": "safelight-spektrafilm-support",
-  "version": "2.0.0",
-  "description": "Spektrafilm Support extension for SafeLight — real-time spectral film simulation via baked LUTs.",
+  "version": "2.1.0",
+  "description": "Spektrafilm Support extension for SafeLight — real-time, per-pixel spectral film simulation (negative → enlarger → print → scan) run live on the GPU.",
   "type": "module",
   "scripts": {
     "build": "vite build",

@@ -29,14 +29,42 @@ from spektrafilm.utils.spectral_upsampling import _illuminant_to_xy
 TC = 64   # chromaticity LUT edge
 NWL = 81
 
+# (film, print, display name, kind, description). kind drives panel grouping;
+# description is shown under the picker. The first seven keep their original
+# print pairings (looks already tuned); newer entries use the engine's declared
+# target_print. Slides (positive, target_print=None) need a different path and
+# are not curated here yet.
 CURATED = [
-    ("kodak_portra_400", "kodak_portra_endura", "Kodak Portra 400"),
-    ("kodak_portra_160", "kodak_portra_endura", "Kodak Portra 160"),
-    ("kodak_ektar_100", "kodak_supra_endura", "Kodak Ektar 100"),
-    ("kodak_gold_200", "kodak_endura_premier", "Kodak Gold 200"),
-    ("kodak_ultramax_400", "kodak_supra_endura", "Kodak Ultramax 400"),
-    ("fujifilm_pro_400h", "kodak_portra_endura", "Fujifilm Pro 400H"),
-    ("kodak_vision3_250d", "kodak_2383", "Kodak Vision3 250D"),
+    # ── Colour negative (still) ──
+    ("kodak_portra_400", "kodak_portra_endura", "Kodak Portra 400", "negative",
+     "The modern portrait standard: fine grain, gentle contrast, forgiving skin tones with a warm lean."),
+    ("kodak_portra_160", "kodak_portra_endura", "Kodak Portra 160", "negative",
+     "Slower Portra: the finest grain of the family and the smoothest, most neutral skin rendering."),
+    ("kodak_portra_800", "kodak_portra_endura", "Kodak Portra 800", "negative",
+     "Fast Portra for low light: more grain and punch while holding Portra's natural skin tones."),
+    ("kodak_ektar_100", "kodak_supra_endura", "Kodak Ektar 100", "negative",
+     "The most saturated, finest-grained colour negative made — vivid landscapes, crisp blues and reds."),
+    ("kodak_gold_200", "kodak_endura_premier", "Kodak Gold 200", "negative",
+     "Consumer warmth: golden, nostalgic colour with friendly contrast and visible everyday grain."),
+    ("kodak_ultramax_400", "kodak_supra_endura", "Kodak Ultramax 400", "negative",
+     "Everyday 400-speed colour: bright, slightly punchy, with cheerful warm-leaning tones."),
+    ("fujifilm_pro_400h", "kodak_portra_endura", "Fujifilm Pro 400H", "negative",
+     "The discontinued cult favourite: airy pastels, minty greens and signature soft highlights."),
+    ("fujifilm_c200", "fujifilm_crystal_archive_typeii", "Fujifilm C200", "negative",
+     "Budget Fuji colour: cool, slightly green-leaning palette with crunchy, characterful grain."),
+    ("fujifilm_xtra_400", "fujifilm_crystal_archive_typeii", "Fujifilm Superia X-tra 400", "negative",
+     "Classic Superia: punchy consumer colour with the trademark Fuji emphasis on greens and reds."),
+    # ── Cinema negative (print on cine stock) ──
+    ("kodak_vision3_50d", "kodak_2383", "Kodak Vision3 50D", "cine",
+     "Slow daylight cine stock: extremely fine grain and clean, true daylight colour."),
+    ("kodak_vision3_250d", "kodak_2383", "Kodak Vision3 250D", "cine",
+     "Daylight-balanced cinema negative printed to 2383 — the modern motion-picture look."),
+    ("kodak_vision3_200t", "kodak_2383", "Kodak Vision3 200T", "cine",
+     "Tungsten-balanced cine stock: cool, cinematic cast under daylight, rich shadow detail."),
+    ("kodak_vision3_500t", "kodak_2383", "Kodak Vision3 500T", "cine",
+     "Fast tungsten cinema stock: the low-light night look, more grain and pronounced halation."),
+    ("kodak_verita_200d", "kodak_2383", "Kodak Verita 200D", "cine",
+     "Still-photography cut of a daylight cine emulsion — clean colour with a motion-picture print."),
 ]
 
 
@@ -123,7 +151,32 @@ def extract(film, prnt):
         "lePrint": [float(le_p[0]), float(le_p[-1])],
         "neutralMY": neutralMY,
     }
-    return pipe, p, dict(filmTc=filmTc, filmCurves=filmCurves, filmSpec=filmSpec, consts=consts)
+    # Per-stock effect parameters for the live halation/grain/glare approximations.
+    # The engine models these in full (multi-bounce halation, binomial grain); the
+    # extension reproduces the *character* — per-channel tint/balance and a film-
+    # plane spatial scale — so each stock's effects differ authentically instead of
+    # using one hardcoded look. Spatial scales are film-plane micrometres; we ship
+    # them as a fraction of the frame width (format_mm) so the shader can map to
+    # any output resolution. (These fields are inert in the engine sim above —
+    # active=False — and only read here for the extension's own effect layer.)
+    hal, grain, glare = p.film_render.halation, p.film_render.grain, p.film_render.glare
+    fmt_um = float(p.camera.film_format_mm) * 1000.0
+    hstr = [float(x) for x in hal.halation_strength]
+    hmax = max(hstr) or 1.0
+    fx = {
+        # Normalised per-channel halation strength → tint; absolute max as the
+        # natural amount. Portra ≈ (0.015,0.005,0) → tint (1,0.33,0).
+        "halTint": [s / hmax for s in hstr],
+        "halStrength": hmax,
+        "halSizeFrac": float(np.mean(hal.halation_first_sigma_um)) / fmt_um,
+        "halBounceDecay": float(hal.halation_bounce_decay),
+        # Per-channel grain particle scale (blue coarser) + particle area (∝ speed).
+        "grainScale": [float(x) for x in grain.particle_scale],
+        "grainAreaUm2": float(grain.particle_area_um2),
+        "grainBlur": float(grain.blur),
+        "glare": float(glare.percent),
+    }
+    return pipe, p, dict(filmTc=filmTc, filmCurves=filmCurves, filmSpec=filmSpec, consts=consts, fx=fx)
 
 
 def _selfcheck(pipe, p, t):
@@ -180,31 +233,56 @@ def _const_block(c):
     return "\\n".join(L)
 
 
+def _fx_ts(fx):
+    def v3(a): return f"[{a[0]:.6g}, {a[1]:.6g}, {a[2]:.6g}]"
+    return (
+        "{ halTint: %s, halStrength: %.6g, halSizeFrac: %.6g, halBounceDecay: %.6g, "
+        "grainScale: %s, grainAreaUm2: %.6g, grainBlur: %.6g, glare: %.6g }"
+    ) % (
+        v3(fx["halTint"]), fx["halStrength"], fx["halSizeFrac"], fx["halBounceDecay"],
+        v3(fx["grainScale"]), fx["grainAreaUm2"], fx["grainBlur"], fx["glare"],
+    )
+
+
 def emit():
     entries = []
-    for film, prnt, name in CURATED:
+    for film, prnt, name, kind, desc in CURATED:
         pipe, p, t = extract(film, prnt)
         err = _selfcheck(pipe, p, t)
         sid = film
         print(f"  {sid}: self-check max err {err:.4f}", file=sys.stderr)
-        entries.append((sid, name, t))
+        entries.append((sid, name, kind, desc, t))
     lines = [
         "// AUTO-GENERATED by tools/extract_stock.py --emit — do not edit.",
         "// Per-stock Spektrafilm data: GLSL const block + 3 packed rgba16f textures",
-        "// (Float32, base64). LUT/spectral data derived from Spektrafilm profiles (CC BY-SA 4.0).",
+        "// (Float32, base64) + per-stock effect parameters (halation/grain/glare).",
+        "// LUT/spectral data derived from Spektrafilm profiles (CC BY-SA 4.0).",
         'import { decodeF32 } from "./film-data";',
         "",
+        "// Per-stock effect character for the live halation/grain/glare layer.",
+        "// halTint: normalised per-channel halation strength (the stock's glow hue).",
+        "// halSizeFrac: halation sigma as a fraction of frame width (resolution-free).",
+        "// grainScale: per-channel grain particle scale (blue is coarser).",
+        "export interface FilmFx {",
+        "  halTint: [number, number, number]; halStrength: number;",
+        "  halSizeFrac: number; halBounceDecay: number;",
+        "  grainScale: [number, number, number]; grainAreaUm2: number;",
+        "  grainBlur: number; glare: number;",
+        "}",
+        "",
         "export interface FilmStockData {",
-        "  id: string; name: string; consts: string;",
+        '  id: string; name: string; kind: "negative" | "cine" | "slide"; description: string;',
+        "  consts: string; fx: FilmFx;",
         "  filmTc: () => Float32Array; tcSize: number;",
         "  filmCurves: () => Float32Array; filmSpec: () => Float32Array;",
         "}",
         "",
         "export const FILM_STOCKS: FilmStockData[] = [",
     ]
-    for sid, name, t in entries:
+    for sid, name, kind, desc, t in entries:
         lines.append(
-            f'  {{ id: {sid!r}, name: {name!r}, tcSize: {TC},\n'
+            f'  {{ id: {sid!r}, name: {name!r}, kind: {kind!r}, description: {desc!r}, tcSize: {TC},\n'
+            f'    fx: {_fx_ts(t["fx"])},\n'
             f'    consts: "{_const_block(t["consts"])}",\n'
             f'    filmTc: () => decodeF32("{_b64(t["filmTc"])}"),\n'
             f'    filmCurves: () => decodeF32("{_b64(t["filmCurves"])}"),\n'
