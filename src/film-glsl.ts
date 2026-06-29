@@ -17,8 +17,14 @@
 // Per-stock uniforms (vec3 columns since mat3 isn't param-bag bindable):
 //   sfRgb2xyz0..2, sfCoup0..2, sfXyz2rgb0..2  (matrix columns)
 //   sfFactor, sfScanNorm, sfLeFilm(vec2 lo/hi), sfLePrint(vec2 lo/hi),
-//   sfNeutralMY(vec2 neutral CC for M/Y)
+//   sfNeutralMY(vec2 neutral CC for M/Y), sfDensMax(vec3, positive silver donor)
 // Live uniforms: sfExposure, sfPrintExp, sfCouplerAmt, sfContrast, sfFiltM, sfFiltY.
+//
+// Reversal (slide) bundles #define SF_POSITIVE in their const block: stages 3-4
+// (enlarger print) are skipped, the developed film is scanned directly, and the
+// scan textures (filmSpec row2/row3) carry the FILM's own dye + viewing
+// illuminant instead of a print paper's. Print-only uniforms (sfPrintExp,
+// sfFiltM/Y) are then unused; sfContrast retargets to the film curve.
 
 export const N_WL = 81;
 
@@ -83,9 +89,30 @@ export const FILM_GLSL = `
   // sfCouplerAmt scales the DIR-coupler cross-talk (1.0 = engine default, 0 =
   // couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
   vec3 sfDens = sf_curve(filmCurves, 0.0, sfLeFilm, sfLogf);             // norm_dc
-  vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfDens, sfCoup0, sfCoup1, sfCoup2);
+  // Reversal (slide) film releases the coupler inhibitor from the SILVER image
+  // (sfDensMax − developed dye), negative film from the dye density itself. The
+  // before-couplers curve (dc0) already bakes the positive inversion; only this
+  // live donor term differs between the two paths.
+#ifdef SF_POSITIVE
+  vec3 sfSilver = sfDensMax - sfDens;
+#else
+  vec3 sfSilver = sfDens;
+#endif
+  vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
+#ifdef SF_POSITIVE
+  // Slides have no print to grade, so Print Contrast becomes a film-curve
+  // contrast: warp developed log-exposure around the film midpoint (1.0 = the
+  // engine's straight reversal curve; >1 harder, <1 softer).
+  float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
+  sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
+#endif
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
+#ifdef SF_POSITIVE
+  // ── Reversal: no enlarger or print paper. The developed slide is scanned
+  // directly (engine scan_film), so the scanned densities ARE the film's. ──
+  vec3 sfCmyP = sfCmyF;
+#else
   // ── Stage 3: print-expose (81-bin spectral) ──
   // Live enlarger filtration is active ONLY when the stock bundle ships the
   // neutral filter pack + dichroic spectra — a re-extraction that #defines
@@ -127,6 +154,7 @@ export const FILM_GLSL = `
   float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
   sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
   vec3 sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);            // morphed print
+#endif
 
   // ── Stage 5: scan (81-bin spectral → XYZ → RGB) ──
   vec3 sfXyz2 = vec3(0.0);

@@ -11,12 +11,16 @@
 #   python tools/extract_stock.py --emit                                 # curated set -> src/stocks_data.generated.ts
 
 import base64
+import json
+import os
 import sys
 
 import numpy as np
 import colour
 
 from spektrafilm.runtime.params_builder import init_params, digest_params
+from spektrafilm.runtime.params_schema import RuntimePhotoParams
+from spektrafilm.profiles.io import profile_from_dict
 from spektrafilm.runtime.pipeline import SimulationPipeline
 from spektrafilm.runtime.topology import Tap
 from spektrafilm.config import STANDARD_OBSERVER_CMFS
@@ -29,11 +33,54 @@ from spektrafilm.utils.spectral_upsampling import _illuminant_to_xy
 TC = 64   # chromaticity LUT edge
 NWL = 81
 
+# Black-and-white stocks are authored locally (tools/bw_profiles/, channel_model
+# "bw") as neutral silver emulsions encoded as three identical panchromatic
+# layers + a neutral dye — see tools/make_bw_profiles.py. They run through the
+# ordinary colour (negative) pipeline and GLSL and come out perfectly grey, so
+# no engine or shader changes are needed; only the loader here differs.
+BW_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bw_profiles")
+
+
+def _is_bw(spec):
+    return os.path.exists(os.path.join(BW_DIR, str(spec) + ".json"))
+
+
+def _load_profile(spec):
+    if _is_bw(spec):
+        with open(os.path.join(BW_DIR, spec + ".json"), encoding="utf-8") as f:
+            return profile_from_dict(json.load(f))
+    from spektrafilm.profiles.io import load_profile
+    return load_profile(spec)
+
+
+def _build_params(film, prnt):
+    """Digested runtime params for a film+print pair. B&W stocks load from the
+    local bw_profiles dir, disable the fitted Hanatos adaptation (tc_lut is built
+    straight from the panchromatic sensitivity), skip the colour-only neutral
+    print-filter database, and turn DIR couplers off (no inter-layer chemistry in
+    a single silver emulsion). Colour/cine stocks keep the engine's defaults."""
+    if not _is_bw(film):
+        return digest_params(init_params(film, prnt))
+    params = RuntimePhotoParams(film=_load_profile(film), print=_load_profile(prnt))
+    params.settings.neutral_print_filters_from_database = False
+    params.settings.apply_hanatos2025_adaptation_window = False
+    params.settings.apply_hanatos2025_adaptation_surface = False
+    params = digest_params(params)
+    params.film_render.dir_couplers.amount = 0.0
+    # B&W effect character must be neutral: equal per-channel grain scale (so the
+    # extension's per-channel grain reads as monochrome, not coloured speckle) and
+    # equal halation strength (a neutral glow, not the colour stocks' red halo).
+    params.film_render.grain.particle_scale = (1.0, 1.0, 1.0)
+    params.film_render.halation.halation_strength = (0.01, 0.01, 0.01)
+    return params
+
 # (film, print, display name, kind, description). kind drives panel grouping;
 # description is shown under the picker. The first seven keep their original
 # print pairings (looks already tuned); newer entries use the engine's declared
-# target_print. Slides (positive, target_print=None) need a different path and
-# are not curated here yet.
+# target_print. Slides (positive, target_print=None) take the reversal path:
+# the print column is a placeholder (ignored — extract() forces io.scan_film=True
+# for positive stocks, so the developed film is scanned directly with no enlarger
+# or print paper). See extract().
 CURATED = [
     # ── Colour negative (still) ──
     ("kodak_portra_400", "kodak_portra_endura", "Kodak Portra 400", "negative",
@@ -65,6 +112,34 @@ CURATED = [
      "Fast tungsten cinema stock: the low-light night look, more grain and pronounced halation."),
     ("kodak_verita_200d", "kodak_2383", "Kodak Verita 200D", "cine",
      "Still-photography cut of a daylight cine emulsion — clean colour with a motion-picture print."),
+    # ── Colour reversal / slide (positive; developed film scanned directly) ──
+    # The print column is a placeholder; positive stocks ignore it (scan_film).
+    ("fujifilm_velvia_100", "kodak_portra_endura", "Fujifilm Velvia 100", "slide",
+     "The legendary saturation slide: electric greens and reds, deep contrast — the landscape standard."),
+    ("fujifilm_provia_100f", "kodak_portra_endura", "Fujifilm Provia 100F", "slide",
+     "The neutral professional chrome: clean, accurate colour and gentler contrast where Velvia goes punchy."),
+    ("kodak_ektachrome_100", "kodak_portra_endura", "Kodak Ektachrome E100", "slide",
+     "Modern E-6 revival: crisp, slightly cool slide with fine grain and clean neutrals."),
+    ("kodak_kodachrome_64", "kodak_portra_endura", "Kodak Kodachrome 64", "slide",
+     "The iconic American chrome: warm reds, deep rich shadows — the National Geographic look."),
+    # ── Black & white (silver negative printed on B&W paper) ──
+    # film + paper are locally authored bw profiles (tools/bw_profiles).
+    ("kodak_tri_x_400", "bw_enlarging_paper", "Kodak Tri-X 400", "bw",
+     "The definitive reportage black-and-white: classic panchromatic tones and gutsy mid-contrast, printed on normal-grade glossy paper."),
+    ("ilford_hp5_plus_400", "bw_enlarging_paper", "Ilford HP5 Plus 400", "bw",
+     "Britain's reportage staple: a touch softer and more forgiving than Tri-X, with long, gentle tonal gradation."),
+    ("ilford_fp4_plus_125", "bw_enlarging_paper", "Ilford FP4 Plus 125", "bw",
+     "Classic medium-speed black-and-white: fine grain, crisp mid-contrast and beautifully clean highlights."),
+    ("kodak_tmax_100", "bw_enlarging_paper", "Kodak T-Max 100", "bw",
+     "Modern tabular-grain stock: exceptionally fine grain, high sharpness and a long, clean straight line."),
+    ("kodak_tmax_400", "bw_enlarging_paper", "Kodak T-Max 400", "bw",
+     "The modern 400: noticeably finer grain than Tri-X with a smoother, more neutral tonal scale."),
+    ("fujifilm_acros_100", "bw_enlarging_paper", "Fujifilm Neopan Acros 100", "bw",
+     "Famous for the smoothest grain of all: silky, almost grainless tones and superb reciprocity."),
+    ("ilford_ortho_plus_80", "bw_enlarging_paper", "Ilford Ortho Plus 80", "bw",
+     "Orthochromatic (red-blind): renders reds near-black and skies dramatically light — the vintage plate look."),
+    ("ilford_delta_3200", "bw_enlarging_paper", "Ilford Delta 3200", "bw",
+     "Fast and atmospheric: lower contrast, deep shadows and pronounced grain for available-light and night work."),
 ]
 
 
@@ -87,13 +162,24 @@ def _resample(lut, size):
 
 
 def extract(film, prnt):
-    p = digest_params(init_params(film, prnt))
+    p = _build_params(film, prnt)
     p.io.input_color_space = "sRGB"; p.io.input_cctf_decoding = False
     p.io.output_color_space = "sRGB"; p.io.output_cctf_encoding = False
     p.camera.auto_exposure = False; p.camera.exposure_compensation_ev = 0.0
     for fld in (p.film_render.grain, p.film_render.halation, p.film_render.glare, p.print_render.glare):
         fld.active = False
     p.film_render.dir_couplers.diffusion_size_um = 0.0
+    # Reversal (slide) path: the engine scans the developed FILM directly — no
+    # enlarger, no print paper (topology drops the two printing nodes). The
+    # printing lanes below become inert placeholders and the GLSL skips stages
+    # 3-4 via #ifdef SF_POSITIVE. Black/white scan corrections are image-global,
+    # so disable them (as auto_exposure already is) to keep the per-pixel port
+    # exact against the engine.
+    positive = bool(p.film.is_positive)
+    if positive:
+        p.io.scan_film = True
+        p.scanner.black_correction = False
+        p.scanner.white_correction = False
     pipe = SimulationPipeline(p); fd, pd = p.film.data, p.print.data
 
     illu_xy = _illuminant_to_xy(p.film.info.reference_illuminant)
@@ -104,29 +190,43 @@ def extract(film, prnt):
     dc_f = np.asarray(fd.density_curves); le_f = np.asarray(fd.log_exposure)
     norm_dc = dc_f - np.nanmin(dc_f, 0)
     Mc = compute_dir_couplers_matrix(p.film_render.dir_couplers) * p.film_render.dir_couplers.amount
-    dc0 = compute_density_curves_before_dir_couplers(norm_dc, le_f, Mc, positive=(p.film.info.type == "positive"))
+    dc0 = compute_density_curves_before_dir_couplers(norm_dc, le_f, Mc, positive=positive)
 
     chD_f, bD_f = _mask_spectral(fd.channel_density, fd.base_density)
-    lamp = standard_illuminant(p.enlarger.illuminant)
-    filt = np.asarray(pipe._enlarger_service.enlarger_filtered_illuminant(lamp))
-    psens = np.nan_to_num(10.0 ** np.asarray(pd.log_sensitivity))
-    pkern = filt[:, None] * psens
-    factor = float(np.asarray(pipe._printing_stage._compute_exposure_factor_midgray(psens, filt)).reshape(-1)[0])
-    # Enlarger dichroic M/Y spectra + the stock's neutral filter pack, so the
-    # shader can recompute filtration LIVE relative to neutral (C held, as on a
-    # real colour head). custom_dichroic_filters.filters columns are C,M,Y; the
-    # baked pkern already carries the neutral pack, so we only ship what's needed
-    # to form the live/neutral dimming ratio. Packed into the spare alpha lanes
-    # of the print/scan kernels (filmSpec row1.a = dichM, row3.a = dichY).
-    dich = np.asarray(custom_dichroic_filters.filters)
-    dichM = dich[:, 1]; dichY = dich[:, 2]
-    neutralMY = [float(p.enlarger.m_filter_neutral), float(p.enlarger.y_filter_neutral)]
+    cmfs = np.asarray(STANDARD_OBSERVER_CMFS[:])
 
-    le_p = np.asarray(pd.log_exposure)
-    morph = np.asarray(apply_print_curves_morph(le_p, pd.density_curves_model, p.print_render.density_curves_morph, profile_type=p.print.info.type))
+    if positive:
+        # Scan the developed film directly under its own viewing illuminant.
+        # Print-expose / print-develop are skipped; their lanes ship as zeros
+        # so old/new readers stay layout-compatible. Scan dye = film dye.
+        pkern = np.zeros((NWL, 3)); dichM = np.zeros(NWL); dichY = np.zeros(NWL)
+        factor = 1.0; neutralMY = [0.0, 0.0]
+        le_p = le_f
+        morph = np.zeros((dc_f.shape[0], 3))          # filmCurves row2 inert
+        chD_p, bD_p = chD_f, bD_f                      # scan dye = film dye
+        scan_il = standard_illuminant(p.film.info.viewing_illuminant)
+    else:
+        lamp = standard_illuminant(p.enlarger.illuminant)
+        filt = np.asarray(pipe._enlarger_service.enlarger_filtered_illuminant(lamp))
+        psens = np.nan_to_num(10.0 ** np.asarray(pd.log_sensitivity))
+        pkern = filt[:, None] * psens
+        factor = float(np.asarray(pipe._printing_stage._compute_exposure_factor_midgray(psens, filt)).reshape(-1)[0])
+        # Enlarger dichroic M/Y spectra + the stock's neutral filter pack, so the
+        # shader can recompute filtration LIVE relative to neutral (C held, as on a
+        # real colour head). custom_dichroic_filters.filters columns are C,M,Y; the
+        # baked pkern already carries the neutral pack, so we only ship what's needed
+        # to form the live/neutral dimming ratio. Packed into the spare alpha lanes
+        # of the print/scan kernels (filmSpec row1.a = dichM, row3.a = dichY).
+        dich = np.asarray(custom_dichroic_filters.filters)
+        dichM = dich[:, 1]; dichY = dich[:, 2]
+        neutralMY = [float(p.enlarger.m_filter_neutral), float(p.enlarger.y_filter_neutral)]
 
-    chD_p, bD_p = _mask_spectral(pd.channel_density, pd.base_density)
-    scan_il = standard_illuminant(p.print.info.viewing_illuminant); cmfs = np.asarray(STANDARD_OBSERVER_CMFS[:])
+        le_p = np.asarray(pd.log_exposure)
+        morph = np.asarray(apply_print_curves_morph(le_p, pd.density_curves_model, p.print_render.density_curves_morph, profile_type=p.print.info.type))
+
+        chD_p, bD_p = _mask_spectral(pd.channel_density, pd.base_density)
+        scan_il = standard_illuminant(p.print.info.viewing_illuminant)
+
     snorm = float(np.sum(scan_il * cmfs[:, 1])); skern = scan_il[:, None] * cmfs
     ixy = colour.XYZ_to_xy(np.einsum("k,kl->l", scan_il, cmfs) / snorm)
     M2 = _lin_mat(lambda e: colour.XYZ_to_RGB(e, colourspace="sRGB", apply_cctf_encoding=False, illuminant=ixy))
@@ -150,6 +250,10 @@ def extract(film, prnt):
         "leFilm": [float(le_f[0]), float(le_f[-1])],
         "lePrint": [float(le_p[0]), float(le_p[-1])],
         "neutralMY": neutralMY,
+        # Per-channel max of the normalised film density curve. Reversal develop
+        # releases couplers from the SILVER image (density_max − dye density), so
+        # the positive GLSL needs this to invert the coupler donor term.
+        "densMax": [float(x) for x in np.nanmax(norm_dc, axis=0)],
     }
     # Per-stock effect parameters for the live halation/grain/glare approximations.
     # The engine models these in full (multi-bounce halation, binomial grain); the
@@ -176,10 +280,10 @@ def extract(film, prnt):
         "grainBlur": float(grain.blur),
         "glare": float(glare.percent),
     }
-    return pipe, p, dict(filmTc=filmTc, filmCurves=filmCurves, filmSpec=filmSpec, consts=consts, fx=fx)
+    return pipe, p, dict(filmTc=filmTc, filmCurves=filmCurves, filmSpec=filmSpec, consts=consts, fx=fx, positive=positive)
 
 
-def _selfcheck(pipe, p, t):
+def _selfcheck(pipe, p, t, verbose=False):
     c = t["consts"]; M1 = np.array(c["rgb2xyz"]).T; Mc = np.array(c["coup"]).T; M2 = np.array(c["xyz2rgb"]).T
     tc = t["filmTc"][..., :3]; norm_dc = t["filmCurves"][0, :, :3]; dc0 = t["filmCurves"][1, :, :3]; morph = t["filmCurves"][2, :, :3]
     chDf = t["filmSpec"][0, :, :3]; bDf = t["filmSpec"][0, :, 3]; pk = t["filmSpec"][1, :, :3]
@@ -199,16 +303,30 @@ def _selfcheck(pipe, p, t):
         return (a * (1 - fx)[..., None] + b * fx[..., None]) * (1 - fy)[..., None] + (d * (1 - fx)[..., None] + e * fx[..., None]) * fy[..., None]
     ax = [0.05, 0.184, 0.4, 0.7, 1.0]; grid = np.array([[r, g, b] for r in ax for g in ax for b in ax]).reshape(1, -1, 3)
     xyz = grid @ M1; bb = np.fmax(xyz.sum(-1), 1e-10); raw = bil(tc, t2q(xyz[..., :2] / bb[..., None])) * bb[..., None]
-    logf = np.log10(np.fmax(raw, 0) + 1e-10); cmyf = itp(dc0, lef, logf - itp(norm_dc, lef, logf) @ Mc)
-    rp = np.zeros(grid.shape)
-    for i in range(NWL): rp += 10 ** (-(cmyf @ chDf[i] + bDf[i]))[..., None] * pk[i]
-    rp *= c["factor"] * float(p.enlarger.print_exposure)
-    logp = np.log10(np.fmax(rp, 0) + 1e-10); cmyp = itp(morph, lep, logp)
+    logf = np.log10(np.fmax(raw, 0) + 1e-10)
+    dens = itp(norm_dc, lef, logf)
+    # Reversal develop releases couplers from the silver image (dMax − dye); the
+    # negative releases them from the dye density directly. dc0 already bakes the
+    # positive curve inversion; this is the per-pixel donor term.
+    silver = (np.nanmax(norm_dc, axis=0) - dens) if t["positive"] else dens
+    cmyf = itp(dc0, lef, logf - silver @ Mc)
+    if t["positive"]:
+        # Reversal: the developed film is scanned directly, no print stage.
+        cmyp = cmyf
+    else:
+        rp = np.zeros(grid.shape)
+        for i in range(NWL): rp += 10 ** (-(cmyf @ chDf[i] + bDf[i]))[..., None] * pk[i]
+        rp *= c["factor"] * float(p.enlarger.print_exposure)
+        logp = np.log10(np.fmax(rp, 0) + 1e-10); cmyp = itp(morph, lep, logp)
     xy2 = np.zeros(grid.shape)
     for i in range(NWL): xy2 += 10 ** (-(cmyp @ chDp[i] + bDp[i]))[..., None] * sk[i]
     rgb = (xy2 / c["scanNorm"]) @ M2
     ref = np.asarray(pipe.process(grid, inject=Tap.RGB_PRE, collect=Tap.RGB_OUT)).reshape(-1, 3)
-    return float(np.abs(rgb.reshape(-1, 3) - ref).max())
+    err = np.abs(rgb.reshape(-1, 3) - ref)
+    if verbose:
+        print(f"    err mean {err.mean():.4f} median {np.median(err):.4f} "
+              f"p95 {np.percentile(err, 95):.4f} max {err.max():.4f}", file=sys.stderr)
+    return float(err.max())
 
 
 def _b64(a):
@@ -218,11 +336,15 @@ def _b64(a):
 def _vec3(v): return f"vec3({v[0]:.8g},{v[1]:.8g},{v[2]:.8g})"
 
 
-def _const_block(c):
+def _const_block(c, positive=False):
     # Signals to the shader that this bundle carries the neutral filter pack +
     # dichroic spectra, enabling the live enlarger-filtration path (#ifdef guard
     # in film-glsl.ts). Older bundles lack it and compile the plain neutral path.
+    # SF_POSITIVE marks a reversal (slide) bundle: the shader skips the print
+    # stages (3-4) and scans the developed film directly.
     L = ["#define SF_HAS_NEUTRAL"]
+    if positive:
+        L.append("#define SF_POSITIVE")
     for nm, key in (("sfRgb2xyz", "rgb2xyz"), ("sfCoup", "coup"), ("sfXyz2rgb", "xyz2rgb")):
         for j in range(3): L.append(f"const vec3 {nm}{j} = {_vec3(c[key][j])};")
     L.append(f"const float sfFactor = {c['factor']:.8g};")
@@ -230,6 +352,7 @@ def _const_block(c):
     L.append(f"const vec2 sfLeFilm = vec2({c['leFilm'][0]:.8g},{c['leFilm'][1]:.8g});")
     L.append(f"const vec2 sfLePrint = vec2({c['lePrint'][0]:.8g},{c['lePrint'][1]:.8g});")
     L.append(f"const vec2 sfNeutralMY = vec2({c['neutralMY'][0]:.8g},{c['neutralMY'][1]:.8g});")
+    L.append(f"const vec3 sfDensMax = {_vec3(c['densMax'])};")
     return "\\n".join(L)
 
 
@@ -271,7 +394,7 @@ def emit():
         "}",
         "",
         "export interface FilmStockData {",
-        '  id: string; name: string; kind: "negative" | "cine" | "slide"; description: string;',
+        '  id: string; name: string; kind: "negative" | "cine" | "slide" | "bw"; description: string;',
         "  consts: string; fx: FilmFx;",
         "  filmTc: () => Float32Array; tcSize: number;",
         "  filmCurves: () => Float32Array; filmSpec: () => Float32Array;",
@@ -283,7 +406,7 @@ def emit():
         lines.append(
             f'  {{ id: {sid!r}, name: {name!r}, kind: {kind!r}, description: {desc!r}, tcSize: {TC},\n'
             f'    fx: {_fx_ts(t["fx"])},\n'
-            f'    consts: "{_const_block(t["consts"])}",\n'
+            f'    consts: "{_const_block(t["consts"], t["positive"])}",\n'
             f'    filmTc: () => decodeF32("{_b64(t["filmTc"])}"),\n'
             f'    filmCurves: () => decodeF32("{_b64(t["filmCurves"])}"),\n'
             f'    filmSpec: () => decodeF32("{_b64(t["filmSpec"])}") }},'
@@ -300,7 +423,7 @@ def main():
     if len(sys.argv) < 3:
         print("usage: extract_stock.py <film> <print> | --emit", file=sys.stderr); return 2
     pipe, p, t = extract(sys.argv[1], sys.argv[2])
-    print(f"self-check max err {_selfcheck(pipe, p, t):.4f}", file=sys.stderr)
+    print(f"self-check max err {_selfcheck(pipe, p, t, verbose=True):.4f}", file=sys.stderr)
     return 0
 
 

@@ -104,13 +104,6 @@ const GRAIN_ID = "spektrafilm-support.grain";
 // costs nothing when you're not using it. See applyStock + the panel's picker.
 const NONE_ID = "none";
 
-// Reference long edge (px) the halation blur radius is anchored to, so the glow
-// covers a CONSTANT fraction of the image at any render resolution. Matches the
-// default developMaxEdge, so the Develop preview of a full-size photo is
-// unchanged; thumbnails (≤960 px) and reduced exports now match it instead of
-// blooming ~6× wider. See buildHalationStage.
-const HAL_REF_EDGE = 4096;
-
 // Grain cells across the frame HEIGHT at size 1.0 — the anchor that makes grain a
 // constant physical size at any output resolution (see buildGrainStage). Chosen
 // to look film-like at the default size; the Size slider tunes from there.
@@ -128,19 +121,29 @@ const DEFAULT_FX: FilmFx = {
 const vec3lit = (v: readonly [number, number, number]) =>
   `vec3(${v.map((x) => x.toFixed(4)).join(", ")})`;
 
+// Slides (reversal) have no enlarger or print paper, so their bundle #defines
+// SF_POSITIVE and the GLSL compiles out the print stages. Drop the print-only
+// uniforms here too (Print Exposure / Filtration M+Y) and retarget Contrast to
+// the film curve, so the panel and the shader agree on what exists.
+const isSlide = (stock: FilmStockData) => stock.kind === "slide";
+
 function buildStage(stock: FilmStockData): ProcessingStageContribution {
+  const slide = isSlide(stock);
+  const uniforms: UniformDeclaration[] = [
+    { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
+    ...(slide ? [] : [{ key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" } as UniformDeclaration]),
+    { key: "sfCouplerAmt", glslType: "float", default: 1, range: { min: 0, max: 2, step: 0.01 }, label: "Coupler Amount" },
+    { key: "sfContrast", glslType: "float", default: 1, range: { min: 0.5, max: 2, step: 0.01 }, label: slide ? "Contrast" : "Print Contrast" },
+    ...(slide ? [] : [
+      { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" } as UniformDeclaration,
+      { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" } as UniformDeclaration,
+    ]),
+  ];
   return {
     id: STAGE_ID,
     name: "Spektrafilm",
     phase: "tone-map",
-    uniforms: [
-      { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
-      { key: "sfPrintExp", glslType: "float", default: 1, range: { min: 0.2, max: 3, step: 0.01 }, label: "Print Exposure" },
-      { key: "sfCouplerAmt", glslType: "float", default: 1, range: { min: 0, max: 2, step: 0.01 }, label: "Coupler Amount" },
-      { key: "sfContrast", glslType: "float", default: 1, range: { min: 0.5, max: 2, step: 0.01 }, label: "Print Contrast" },
-      { key: "sfFiltM", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration M" },
-      { key: "sfFiltY", glslType: "float", default: 0, range: { min: -100, max: 100, step: 1 }, label: "Filtration Y" },
-    ],
+    uniforms,
     textures: [
       { key: "filmTc", kind: "lut", format: "rgba16f" },
       { key: "filmCurves", kind: "lut", format: "rgba16f" },
@@ -157,31 +160,24 @@ function buildStage(stock: FilmStockData): ProcessingStageContribution {
 // Back-reflection halation: bright scene light scatters through the film base
 // and reflects back, blooming a glow around highlights whose HUE is the stock's
 // own anti-halation balance (Portra ≈ (1,0.33,0); other stocks differ — extracted
-// per stock into fx.halTint). Two separable Gaussian prepasses blur the source
-// highlights (scatter follows scene light, so the source is the right driver);
-// the inline effects pass adds the tinted glow to display colour `c`. Default
-// amount 0 → off until dialled in.
+// per stock into fx.halTint).
 //
-// The blur radius is anchored to HAL_REF_EDGE so the halo spans a constant
-// FRACTION of the image regardless of the prepass resolution. uTexel = 1/dim,
-// so the radius is a fixed texel count only at the reference size; at other
-// sizes it scales by (long edge / reference). Without this, the same texel-count
-// blur spread ~6× wider on a 640 px grid thumbnail than on the 4096 px Develop
-// preview, pushing the glow far further into the surrounds — which read as a
-// different colour between Develop and thumbnails/exports.
-function buildHalationStage(fx: FilmFx): ProcessingStageContribution {
-  const blur = (axis: "x" | "y", extract: boolean) => `
-    float halLong = max(1.0 / uTexel.x, 1.0 / uTexel.y);
-    float r = max(sfHalSize, 0.0) * (halLong / ${HAL_REF_EDGE}.0);
-    vec3 sum = vec3(0.0); float wsum = 0.0;
-    for (int k = -8; k <= 8; k++) {
-      float fk = float(k);
-      float w = exp(-fk * fk / 32.0);
-      vec3 s = readPrev(vUv + vec2(${axis === "x" ? "fk * r * uTexel.x, 0.0" : "0.0, fk * r * uTexel.y"}));
-      sum += ${extract ? "max(s - sfHalThreshold, 0.0)" : "s"} * w;
-      wsum += w;
-    }
-    c = sum / wsum;`;
+// Implemented as a MIP-CHAIN bloom done entirely INLINE — deliberately NOT the
+// host's multi-pass prepass framework, which was silently falling back to the raw
+// source on some setups (capped prepass-stage budget) and washing the frame with
+// tint. The source `uImage` already carries a mip chain the core itself samples
+// for blur (textureLod(uImage, uv, lod)); sampling it at a Size-derived LOD gives
+// a blurred copy of the source per pixel with zero extra passes, so Size/Threshold
+// always respond and there's nothing to fall back. Threshold isolates highlights;
+// Amount screen-blends the tinted glow over the film output `c` (bright areas
+// barely change, so the halo spreads into darker surroundings). Default amount
+// 0 → off until dialled in.
+function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContribution {
+  const lumaW = "vec3(0.2126, 0.7152, 0.0722)";
+  // B&W desaturates the blurred highlights so the halo is neutral grey; colour
+  // stocks keep the source colour and tint it by the stock's halation balance.
+  const desat = mono ? `sfBlur = vec3(dot(max(sfBlur, 0.0), ${lumaW}));` : "";
+  const tint = mono ? "vec3(1.0)" : vec3lit(fx.halTint);
   return {
     id: HAL_ID,
     name: "Halation",
@@ -189,19 +185,19 @@ function buildHalationStage(fx: FilmFx): ProcessingStageContribution {
     priority: 50,
     uniforms: [
       { key: "sfHalAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Halation" },
+      // Size = blur LOD into the source mip chain (0 = sharp highlights, 8 = very
+      // wide glow). Trilinear (fractional LOD) keeps the spread smooth.
+      { key: "sfHalSize", glslType: "float", default: 4, range: { min: 0, max: 8, step: 0.1 }, label: "Size" },
+      // Only source values above the threshold bloom; range past 1.0 so it can
+      // gate bright (HDR) highlights on the RAW float path.
+      { key: "sfHalThreshold", glslType: "float", default: 0.6, range: { min: 0, max: 2, step: 0.01 }, label: "Threshold" },
     ],
-    passes: [
-      { glsl: blur("x", true), uniforms: [
-        { key: "sfHalSize", glslType: "float", default: 3, range: { min: 0, max: 8, step: 0.1 } },
-        { key: "sfHalThreshold", glslType: "float", default: 0.6, range: { min: 0, max: 1, step: 0.01 } },
-      ] },
-      { glsl: blur("y", false), uniforms: [
-        { key: "sfHalSize", glslType: "float", default: 3, range: { min: 0, max: 8, step: 0.1 } },
-      ] },
-    ],
-    // stageResult = blurred highlights (scene-linear); approx-encode to display
-    // before adding the stock-tinted glow to `c`. Tint is baked per stock.
-    glsl: `c += sfHalAmount * ${vec3lit(fx.halTint)} * pow(max(stageResult, 0.0), vec3(0.4545));`,
+    glsl: `
+      vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
+      ${desat}
+      vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
+      vec3 hgl = clamp(sfHalAmount * ${tint} * sfHi, 0.0, 1.0);
+      c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);`,
   };
 }
 
@@ -215,11 +211,22 @@ function buildHalationStage(fx: FilmFx): ProcessingStageContribution {
 // the grain is a CONSTANT size at any output resolution — Develop, thumbnail and
 // export match (gl_FragCoord, the old coordinate, scaled with the render size and
 // made grain coarser on small thumbnails). Default amount 0 → off until dialled in.
-function buildGrainStage(fx: FilmFx): ProcessingStageContribution {
+function buildGrainStage(fx: FilmFx, mono = false): ProcessingStageContribution {
   // Normalise per-channel scale to mean 1 so it only sets RELATIVE coarseness
   // (overall size stays on the Size slider); larger scale → coarser → fewer cells.
   const gm = (fx.grainScale[0] + fx.grainScale[1] + fx.grainScale[2]) / 3 || 1;
   const gs = fx.grainScale.map((x) => (x / gm).toFixed(4));
+  // Two octaves of value noise (fine + finer) read more like real silver grain
+  // than a single octave, which looks blobby/cellular. B&W grain is monochrome
+  // (ONE shared noise → luminance grain); colour stocks use decorrelated
+  // per-channel noise (coloured grain) at per-channel coarseness.
+  const grainNoise = mono
+    ? "vec3 gn = vec3(sfGrain2(gbase) - 0.5);"
+    : `vec3 gn = vec3(
+        sfGrain2(gbase / ${gs[0]}),
+        sfGrain2(gbase / ${gs[1]} + vec2(37.0, 11.0)),
+        sfGrain2(gbase / ${gs[2]} + vec2(91.0, 53.0))
+      ) - 0.5;`;
   return {
     id: GRAIN_ID,
     name: "Grain",
@@ -237,17 +244,21 @@ function buildGrainStage(fx: FilmFx): ProcessingStageContribution {
         vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
         return mix(mix(sfHash1(i), sfHash1(i + vec2(1.0, 0.0)), f.x),
                    mix(sfHash1(i + vec2(0.0, 1.0)), sfHash1(i + vec2(1.0, 1.0)), f.x), f.y);
+      }
+      // Two-octave grain: a fine base plus a finer, rotated detail octave, biased
+      // toward the high frequency so the texture is crisp rather than cloudy.
+      float sfGrain2(vec2 p) {
+        float a = sfValNoise(p);
+        float b = sfValNoise(p * 2.17 + vec2(19.0, 7.0));
+        return clamp(0.5 + (a - 0.5) * 0.55 + (b - 0.5) * 0.85, 0.0, 1.0);
       }`,
     glsl: `
       // Frame-relative, square-celled, resolution-independent grain coordinate.
       vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${GRAIN_REF}.0 / max(sfGrainSize, 0.5));
       // Per-channel coarseness (÷scale) + a per-channel offset so the three
       // channels are independent (coloured grain), not one luminance grain tinted.
-      vec3 gn = vec3(
-        sfValNoise(gbase / ${gs[0]}),
-        sfValNoise(gbase / ${gs[1]} + vec2(37.0, 11.0)),
-        sfValNoise(gbase / ${gs[2]} + vec2(91.0, 53.0))
-      ) - 0.5;
+      // B&W stocks override this with a single shared noise (monochrome grain).
+      ${grainNoise}
       float glum = dot(c, vec3(0.2126, 0.7152, 0.0722));
       float genv = 2.0 * sqrt(max(glum * (1.0 - glum), 0.0));
       c += sfGrainAmount * genv * gn;`,
@@ -256,7 +267,29 @@ function buildGrainStage(fx: FilmFx): ProcessingStageContribution {
 
 let theApi: SafelightAPI | null = null;
 let texVersion = 1;
-let setPanelStock: ((id: string) => void) | null = null;
+
+// Per-image film-stock selection. The chosen stock lives in the develop paramBag
+// (like the sliders) so it round-trips PER PHOTO, stored as a numeric index into
+// FILM_STOCKS (-1 = None/off). Untouched photos default to None — the film is
+// strictly opt-in per image, never inherited from another photo. `appliedStockId`
+// tracks what's currently registered on the GPU so we re-apply only when the
+// active photo asks for a different stock (re-registering recompiles). A store
+// subscription re-runs this on every photo switch (loadEdit updates paramBag).
+const K_STOCK = STAGE_ID + ".__stock";
+let appliedStockId: string | null = null;
+let storeUnsub: (() => void) | null = null;
+
+function stockIndexForId(id: string): number {
+  if (id === NONE_ID) return -1;
+  const i = FILM_STOCKS.findIndex((s) => s.id === id);
+  return i >= 0 ? i : 0;
+}
+
+function stockIdFromBag(bag: Record<string, unknown>): string {
+  const idx = bag[K_STOCK];
+  if (typeof idx === "number") return idx < 0 ? NONE_ID : (FILM_STOCKS[idx]?.id ?? NONE_ID);
+  return NONE_ID; // untouched photo → off
+}
 
 function applyStock(api: SafelightAPI, id: string): void {
   if (id === NONE_ID) {
@@ -273,15 +306,27 @@ function applyStock(api: SafelightAPI, id: string): void {
     return;
   }
   const stock = FILM_STOCKS.find((s) => s.id === id) ?? FILM_STOCKS[0];
+  const isBw = stock.kind === "bw";
   api.registerProcessingStage(buildStage(stock));
   // Re-register the effect stages so halation tint / grain balance follow the
-  // selected stock (cheap recompile, same as swapping the film stage).
-  api.registerProcessingStage(buildHalationStage(stock.fx));
-  api.registerProcessingStage(buildGrainStage(stock.fx));
+  // selected stock (cheap recompile, same as swapping the film stage). B&W gets
+  // a neutral (monochrome) halation glow and grain.
+  api.registerProcessingStage(buildHalationStage(stock.fx, isBw));
+  api.registerProcessingStage(buildGrainStage(stock.fx, isBw));
   const v = ++texVersion;
   api.setStageTexture(STAGE_ID, "filmTc", { data: stock.filmTc(), width: stock.tcSize, height: stock.tcSize, format: "rgba16f", version: v });
   api.setStageTexture(STAGE_ID, "filmCurves", { data: stock.filmCurves(), width: 256, height: 3, format: "rgba16f", version: v });
   api.setStageTexture(STAGE_ID, "filmSpec", { data: stock.filmSpec(), width: 81, height: 4, format: "rgba16f", version: v });
+}
+
+// Apply the stock the active photo's paramBag asks for, but only when it actually
+// changed — re-registering stages recompiles, so a photo switch that keeps the
+// same stock is a no-op. Called once on activate and on every develop-store change.
+function ensureStockApplied(api: SafelightAPI, bag: Record<string, unknown>): void {
+  const id = stockIdFromBag(bag);
+  if (id === appliedStockId) return;
+  appliedStockId = id;
+  applyStock(api, id);
 }
 
 // ─── Panel control layout ───────────────────────────────────────────────────
@@ -290,37 +335,70 @@ function applyStock(api: SafelightAPI, id: string): void {
 // its default and its section can never drift apart.
 interface Ctrl { stage: string; key: string; label: string; min: number; max: number; dflt: number; step: number; }
 interface PanelSection { id: string; title: string; hint: string; ctrls: Ctrl[]; }
-const SECTIONS: PanelSection[] = [
-  { id: "film", title: "Film", hint: "Negative exposure, enlarger print, development and live colour-head filtration.", ctrls: [
-    { stage: STAGE_ID, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
-    { stage: STAGE_ID, key: "sfPrintExp", label: "Print Exposure", min: 0.2, max: 3, dflt: 1, step: 0.01 },
-    { stage: STAGE_ID, key: "sfCouplerAmt", label: "Coupler Amount", min: 0, max: 2, dflt: 1, step: 0.01 },
-    { stage: STAGE_ID, key: "sfContrast", label: "Print Contrast", min: 0.5, max: 2, dflt: 1, step: 0.01 },
-    { stage: STAGE_ID, key: "sfFiltM", label: "Filtration M", min: -100, max: 100, dflt: 0, step: 1 },
-    { stage: STAGE_ID, key: "sfFiltY", label: "Filtration Y", min: -100, max: 100, dflt: 0, step: 1 },
-  ] },
-  { id: "halation", title: "Halation", hint: "Back-reflection highlight glow, tinted to the selected stock. Off at 0.", ctrls: [
-    { stage: HAL_ID, key: "sfHalAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
-    { stage: HAL_ID, key: "sfHalSize", label: "Size", min: 0, max: 8, dflt: 3, step: 0.1 },
-    { stage: HAL_ID, key: "sfHalThreshold", label: "Threshold", min: 0, max: 1, dflt: 0.6, step: 0.01 },
-  ] },
-  { id: "grain", title: "Grain", hint: "Midtone-peaked, per-channel film grain at the stock's coarseness. Off at 0.", ctrls: [
-    { stage: GRAIN_ID, key: "sfGrainAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
-    { stage: GRAIN_ID, key: "sfGrainSize", label: "Size", min: 0.5, max: 5, dflt: 1.5, step: 0.1 },
-  ] },
+
+// Film controls differ by path: negatives expose the full enlarger-print chain;
+// slides (reversal) have no print, so only Exposure / Coupler Amount / a film-
+// curve Contrast apply (mirrors buildStage's per-path uniform set).
+const FILM_CTRLS_NEG: Ctrl[] = [
+  { stage: STAGE_ID, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
+  { stage: STAGE_ID, key: "sfPrintExp", label: "Print Exposure", min: 0.2, max: 3, dflt: 1, step: 0.01 },
+  { stage: STAGE_ID, key: "sfCouplerAmt", label: "Coupler Amount", min: 0, max: 2, dflt: 1, step: 0.01 },
+  { stage: STAGE_ID, key: "sfContrast", label: "Print Contrast", min: 0.5, max: 2, dflt: 1, step: 0.01 },
+  { stage: STAGE_ID, key: "sfFiltM", label: "Filtration M", min: -100, max: 100, dflt: 0, step: 1 },
+  { stage: STAGE_ID, key: "sfFiltY", label: "Filtration Y", min: -100, max: 100, dflt: 0, step: 1 },
 ];
-// Flat { "stage.key": default } map for a full reset.
+const FILM_CTRLS_POS: Ctrl[] = [
+  { stage: STAGE_ID, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
+  { stage: STAGE_ID, key: "sfCouplerAmt", label: "Coupler Amount", min: 0, max: 2, dflt: 1, step: 0.01 },
+  { stage: STAGE_ID, key: "sfContrast", label: "Contrast", min: 0.5, max: 2, dflt: 1, step: 0.01 },
+];
+// B&W runs the full negative→print path, so the bundle keeps the negative uniform
+// set, but DIR couplers and colour-head filtration are meaningless for a neutral
+// silver emulsion. The panel shows just the darkroom essentials: film exposure,
+// print exposure (print lightness) and Print Contrast (the paper grade).
+const FILM_CTRLS_BW: Ctrl[] = [
+  { stage: STAGE_ID, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
+  { stage: STAGE_ID, key: "sfPrintExp", label: "Print Exposure", min: 0.2, max: 3, dflt: 1, step: 0.01 },
+  { stage: STAGE_ID, key: "sfContrast", label: "Paper Grade", min: 0.5, max: 2, dflt: 1, step: 0.01 },
+];
+const HAL_CTRLS: Ctrl[] = [
+  { stage: HAL_ID, key: "sfHalAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
+  { stage: HAL_ID, key: "sfHalSize", label: "Size", min: 0, max: 8, dflt: 4, step: 0.1 },
+  { stage: HAL_ID, key: "sfHalThreshold", label: "Threshold", min: 0, max: 2, dflt: 0.6, step: 0.01 },
+];
+const GRAIN_CTRLS: Ctrl[] = [
+  { stage: GRAIN_ID, key: "sfGrainAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
+  { stage: GRAIN_ID, key: "sfGrainSize", label: "Size", min: 0.5, max: 5, dflt: 1.5, step: 0.1 },
+];
+
+function filmCtrlsFor(kind: string): Ctrl[] {
+  if (kind === "slide") return FILM_CTRLS_POS;
+  if (kind === "bw") return FILM_CTRLS_BW;
+  return FILM_CTRLS_NEG;
+}
+function sectionsFor(kind: string): PanelSection[] {
+  const filmHint =
+    kind === "slide" ? "Slide exposure, development and contrast (reversal film, scanned directly — no enlarger print)."
+    : kind === "bw" ? "Darkroom black & white: film exposure, print exposure (print lightness) and paper grade (contrast)."
+    : "Negative exposure, enlarger print, development and live colour-head filtration.";
+  return [
+    { id: "film", title: "Film", hint: filmHint, ctrls: filmCtrlsFor(kind) },
+    { id: "halation", title: "Halation", hint: "Back-reflection highlight glow, tinted to the selected stock. Off at 0.", ctrls: HAL_CTRLS },
+    { id: "grain", title: "Grain", hint: "Midtone-peaked, per-channel film grain at the stock's coarseness. Off at 0.", ctrls: GRAIN_CTRLS },
+  ];
+}
+// Flat { "stage.key": default } map for a full reset — union across every path
+// (FILM_CTRLS_NEG is a superset of the slide/bw film keys) so reset clears every
+// control regardless of the current stock.
 const ALL_DEFAULTS: Record<string, number> = Object.fromEntries(
-  SECTIONS.flatMap((s) => s.ctrls.map((c) => [`${c.stage}.${c.key}`, c.dflt])),
+  [...FILM_CTRLS_NEG, ...HAL_CTRLS, ...GRAIN_CTRLS].map((c) => [`${c.stage}.${c.key}`, c.dflt]),
 );
 
 function resetPanel(api: SafelightAPI): void {
-  api.stores.useDevelopStore.getState().setDynParams({ ...ALL_DEFAULTS });
-  const def = FILM_STOCKS[0].id;
-  api.settings.set("stock", def);
-  applyStock(api, def);
-  setPanelStock?.(def);
-  // Persist the reset so it survives a library round-trip / reload.
+  // Reset every slider AND turn the stock off (None is the per-image default),
+  // then apply + persist so the reset survives a library round-trip / reload.
+  api.stores.useDevelopStore.getState().setDynParams({ ...ALL_DEFAULTS, [K_STOCK]: -1 });
+  ensureStockApplied(api, api.stores.useDevelopStore.getState().paramBag);
   void api.stores.useDevelopStore.getState().commitEdit("Spektrafilm Reset");
 }
 
@@ -383,8 +461,14 @@ export function activate(api: SafelightAPI): void {
   // No bundled film-stock data → don't register the film stage (it can't be
   // built); the panel shows a getting-started view instead.
   if (FILM_STOCKS.length > 0) {
-    // applyStock registers the film stage AND the per-stock effect stages.
-    applyStock(api, api.settings.get("stock", FILM_STOCKS[0].id));
+    // Apply the active photo's stock now, then follow per-photo changes: a photo
+    // switch (loadEdit) replaces the develop-store paramBag, so re-resolve the
+    // stock on every store change (ensureStockApplied no-ops when unchanged).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const store = api.stores.useDevelopStore;
+    ensureStockApplied(api, store.getState().paramBag ?? {});
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    storeUnsub = store.subscribe((state: any) => ensureStockApplied(api, state?.paramBag ?? {}));
   } else {
     // Still register the effects (fallback character) so they compile and the
     // panel's getting-started view shows. Both default to amount 0 → inert.
@@ -408,16 +492,15 @@ export function activate(api: SafelightAPI): void {
     const paramBag: Record<string, unknown> = useDevelopStore((s: any) => s.paramBag);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const setDynParam: (k: string, v: number) => void = useDevelopStore((s: any) => s.setDynParam);
-    const [stock, setStock] = React.useState(() => api.settings.get("stock", FILM_STOCKS[0]?.id ?? ""));
     // Section open/closed state (Film open; effects collapsed since they're off by
     // default). One object so the number of hooks stays constant — no per-section
     // useState in a loop.
     const [open, setOpen] = React.useState({ film: true, halation: false, grain: false });
 
-    React.useEffect(() => {
-      setPanelStock = setStock;
-      return () => { if (setPanelStock === setStock) setPanelStock = null; };
-    }, []);
+    // The selected stock is DERIVED from the per-image paramBag (re-rendered on
+    // every photo switch), not local/global state — so the picker follows the
+    // active photo. The store subscription (activate) keeps the GPU stage in sync.
+    const stock = stockIdFromBag(paramBag);
 
     // No bundled film-stock data → the film controls are useless; show a
     // getting-started view instead (the looks are generated offline from the
@@ -474,7 +557,7 @@ export function activate(api: SafelightAPI): void {
 
     // Group the picker by film family and surface the selected stock's blurb.
     const KIND_LABEL: Record<string, string> = {
-      negative: "Colour negative", cine: "Cinema", slide: "Slide / reversal",
+      negative: "Colour negative", cine: "Cinema", slide: "Slide / reversal", bw: "Black & white",
     };
     const kinds = FILM_STOCKS.map((s) => s.kind).filter((k, i, a) => a.indexOf(k) === i);
     const stockOptions = kinds.map((k) =>
@@ -483,6 +566,7 @@ export function activate(api: SafelightAPI): void {
           h("option", { key: s.id, value: s.id }, s.name))));
     const activeStock = FILM_STOCKS.find((s) => s.id === stock) ?? FILM_STOCKS[0];
     const isNone = stock === NONE_ID;
+    const sections = sectionsFor(activeStock.kind);
 
     return h(
       "div",
@@ -495,9 +579,9 @@ export function activate(api: SafelightAPI): void {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onChange: (e: any) => {
             const id = e.target.value as string;
-            setStock(id);
-            api.settings.set("stock", id);
-            applyStock(api, id);
+            useDevelopStore.getState().setDynParam(K_STOCK, stockIndexForId(id)); // per-image selection
+            ensureStockApplied(api, useDevelopStore.getState().paramBag);
+            commit();                                                            // persist on this photo
           },
           className: "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3",
         },
@@ -512,7 +596,7 @@ export function activate(api: SafelightAPI): void {
         : h("p",
             { className: "text-[11px] text-text-secondary", style: { lineHeight: 1.35, margin: "2px 0 4px" } },
             activeStock.description),
-      isNone ? null : SECTIONS.map(renderSection),
+      isNone ? null : sections.map(renderSection),
     );
   }
 
@@ -526,6 +610,9 @@ export function activate(api: SafelightAPI): void {
 }
 
 export function deactivate(): void {
+  storeUnsub?.();
+  storeUnsub = null;
+  appliedStockId = null;
   theApi?.setStageTexture(STAGE_ID, "filmTc", null);
   theApi?.setStageTexture(STAGE_ID, "filmCurves", null);
   theApi?.setStageTexture(STAGE_ID, "filmSpec", null);

@@ -3,13 +3,24 @@
 A [SafeLight](https://github.com/anthonyreimche/SafeLight) extension that runs
 [**Spektrafilm**](https://github.com/andreavolpato/spektrafilm) — Andrea
 Volpato's physically-based *spectral* simulation of analog photography
-(negative → enlarger → print → scan) — **live, per pixel, on the GPU**. Not a
-baked LUT: it runs the actual 5-stage spectral pipeline with adjustable exposure
+(expose → develop → enlarger → print → scan) — **live, per pixel, on the GPU**.
+Not a baked LUT: it runs the actual spectral pipeline with adjustable exposure
 and print exposure.
 
-It adds a **Spektrafilm** panel to the Develop module: pick a film stock and dial
-in exposure, print exposure, DIR-coupler strength, print contrast, live enlarger
-filtration, and per-stock halation and grain.
+It adds a **Spektrafilm** panel to the Develop module with **26 stocks** across
+four families — colour negative, cinema, **slide/reversal**, and **black &
+white** — and live controls for exposure, print exposure, coupler strength,
+contrast/grade, enlarger filtration, halation and grain.
+
+Three light paths run through the one engine port:
+
+- **Colour negative / cinema** — the full five-stage negative→enlarger→print→scan.
+- **Slide / reversal** — the engine's positive path: expose → develop → scan the
+  developed film directly (no enlarger or print paper).
+- **Black & white** — a real silver neg printed on B&W paper. Modelled as a
+  neutral emulsion (three identical panchromatic layers + neutral dye), so it
+  runs the real neg→paper→scan path and comes out perfectly grey, with the
+  colour→grey rendering coming from each stock's spectral sensitivity.
 
 ## How it works
 
@@ -52,13 +63,17 @@ Per-stock, all live (no re-bake):
 - **Halation** (Amount / Size / Threshold) — back-reflection highlight glow,
   tinted by the stock's own anti-halation balance, resolution-independent.
 - **Grain** (Amount / Size) — midtone-peaked, per-channel film grain at the
-  stock's grain character, resolution-independent.
+  stock's grain character, resolution-independent (monochrome for B&W stocks).
 
-Halation and grain default to 0 (off) until dialled in.
+Halation and grain default to 0 (off) until dialled in. The control set follows
+the stock: **slides** drop Print Exposure / filtration (no enlarger) and expose a
+film-curve **Contrast**; **black & white** shows the darkroom essentials —
+Exposure, Print Exposure and **Paper Grade** (couplers and colour-head filtration
+are meaningless for a neutral silver emulsion).
 
 ## Bundled film stocks
 
-Fourteen stocks ship in the picker, grouped by family.
+Twenty-six stocks ship in the picker, grouped by family.
 
 **Colour negative**
 
@@ -84,8 +99,34 @@ Fourteen stocks ship in the picker, grouped by family.
 | Kodak Vision3 500T | kodak_vision3_500t → kodak_2383 |
 | Kodak Verita 200D | kodak_verita_200d → kodak_2383 |
 
-Slide/reversal stocks (Velvia, Provia, Kodachrome, Ektachrome) need a different
-extraction path (no print stage) and aren't bundled yet.
+**Slide / reversal** (positive path — the developed film is scanned directly)
+
+| Stock | Profile |
+|---|---|
+| Fujifilm Velvia 100 | fujifilm_velvia_100 |
+| Fujifilm Provia 100F | fujifilm_provia_100f |
+| Kodak Ektachrome E100 | kodak_ektachrome_100 |
+| Kodak Kodachrome 64 | kodak_kodachrome_64 |
+
+**Black & white** (silver negative printed on B&W paper)
+
+| Stock | Sensitisation |
+|---|---|
+| Kodak Tri-X 400 | classic panchromatic |
+| Ilford HP5 Plus 400 | classic panchromatic |
+| Ilford FP4 Plus 125 | classic panchromatic |
+| Kodak T-Max 100 | tabular-grain |
+| Kodak T-Max 400 | tabular-grain |
+| Fujifilm Neopan Acros 100 | fine-grain panchromatic |
+| Ilford Ortho Plus 80 | orthochromatic (red-blind) |
+| Ilford Delta 3200 | fast panchromatic |
+
+The B&W stocks are **datasheet-*shaped* parametric models** (sensitisation class +
+published gamma/toe/shoulder), not measured spectral traces — see
+[tools/make_bw_profiles.py](tools/make_bw_profiles.py). They share one normal-grade
+glossy paper and differ by spectral sensitivity (colour→grey rendering) and
+characteristic curve (contrast). The orthochromatic stock renders reds near-black
+and skies light — the classic plate look.
 
 ## Adding your own stocks
 
@@ -100,11 +141,17 @@ pyfftw); skip the GUI extras (PySide6/napari). List what's available with
 `spektrafilm-lut list film` / `list print`.
 
 **2. Edit the `CURATED` list** in [tools/extract_stock.py](tools/extract_stock.py)
-(film slug, print slug, display name, kind `negative|cine|slide`, one-line description).
+(film slug, print slug, display name, kind `negative|cine|slide|bw`, one-line
+description). Slide stocks are auto-detected from the engine profile (`positive`
+type, scanned directly). **Black & white** stocks load from locally-authored
+profiles in `tools/bw_profiles/` — run `python tools/make_bw_profiles.py` to
+(re)generate them, and edit the `FILMS` table in
+[tools/make_bw_profiles.py](tools/make_bw_profiles.py) to add or tune a stock.
 
 **3. Regenerate + rebuild:**
 
 ```bash
+python tools/make_bw_profiles.py       # (B&W only) writes tools/bw_profiles/*.json
 python tools/extract_stock.py --emit   # runs the engine → src/stocks_data.generated.ts
 npm run build                          # bundles the data into dist/index.js
 ```
@@ -117,10 +164,13 @@ install/reload.
 
 - Gamut compression uses ACES RGC as a stand-in for the engine's perceptual
   `cam16ucs` — the spectral stages are exact; only extreme out-of-gamut colours
-  differ slightly.
+  differ slightly. (B&W output is neutral, so it has no such residual.)
 - Halation and grain are real-time approximations (separable Gaussian back-
   reflection bloom; binomial-statistics grain peaking in the midtones), not the
   engine's full physical models. They run live as prepass / inline effects.
+- **Black & white** stocks are datasheet-*shaped* parametric models, not measured
+  spectral data, and use a single normal-grade paper: grade/contrast is the Paper
+  Grade control, not true variable-contrast (two-emulsion) filtration.
 
 ## Installation
 
@@ -142,10 +192,14 @@ float textures) — hence `minAppVersion`.
 
 - **This extension's code: GPL-3.0-or-later** ([LICENSE](LICENSE)) — it implements
   the Spektrafilm pipeline and its extractor drives the GPLv3 engine.
-- **Bundled spectral data** (`src/stocks_data.generated.ts`) is **CC BY-SA 4.0**:
-  extracted by Spektrafilm 0.3.4 from profiles © 2026 Andrea Volpato and repacked
-  (float textures + GLSL constants) for this extension. Under ShareAlike,
-  redistributions must keep the CC BY-SA 4.0 licence and this attribution.
-  <https://creativecommons.org/licenses/by-sa/4.0/>
+- **Bundled spectral data** (`src/stocks_data.generated.ts`) is mixed-source:
+  - *Colour negative, cinema and slide* stocks are **CC BY-SA 4.0** — extracted
+    from profiles © 2026 Andrea Volpato and repacked (float textures + GLSL
+    constants). Under ShareAlike, redistributions must keep the CC BY-SA 4.0
+    licence and this attribution. <https://creativecommons.org/licenses/by-sa/4.0/>
+  - *Black & white* stocks (`tools/bw_profiles/`, generated by
+    `tools/make_bw_profiles.py`) are **GPL-3.0-or-later**, © 2026 Anthony Reimche —
+    original datasheet-shaped models authored for this extension, not derived from
+    the CC BY-SA profiles.
 
 Spektrafilm © Andrea Volpato — https://github.com/andreavolpato/spektrafilm

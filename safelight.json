@@ -1,13 +1,13 @@
 {
 	"id": "spektrafilm-support",
 	"name": "Spektrafilm Support",
-	"version": "2.1.0",
-	"description": "Real-time spectral film simulation — Spektrafilm's full negative → enlarger → print → scan pipeline, run live per pixel on the GPU, with halation and grain.",
+	"version": "2.2.0",
+	"description": "Real-time spectral film simulation — colour negative, slide and black & white, run live per pixel on the GPU through Spektrafilm's full expose → develop → print → scan pipeline, with halation and grain.",
 	"author": "Anthony Reimche",
 	"main": "dist/index.js",
 	"license": "GPL-3.0-or-later",
 	"categories": ["Color"],
 	"keywords": ["film", "spektrafilm", "lut", "analog", "halation", "grain"],
 	"repository": "anthonyreimche/Spektrafilm-Support-for-Safelight",
-	"minAppVersion": "2.3.0"
+	"minAppVersion": "2.4.3"
 }
