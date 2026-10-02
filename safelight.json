@@ -1,7 +1,7 @@
 {
 	"id": "spektrafilm-support",
 	"name": "Spektrafilm Support",
-	"version": "2.2.0",
+	"version": "2.2.1",
 	"description": "Real-time spectral film simulation — colour negative, slide and black & white, run live per pixel on the GPU through Spektrafilm's full expose → develop → print → scan pipeline, with halation and grain.",
 	"author": "Anthony Reimche",
 	"main": "dist/index.js",

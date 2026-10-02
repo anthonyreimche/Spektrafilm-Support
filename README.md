@@ -185,6 +185,7 @@ repo URL into the panel.
 npm install
 npm run build      # → dist/index.js   (commit this — installs load the prebuilt bundle)
 npm run typecheck  # tsc --noEmit
+npm run test:gpu   # grain spec on a real WebGL2 driver, via a SafeLight checkout's rig
 ```
 
 Requires the host's **rgba16f stage-texture API** (`api.setStageTexture` with

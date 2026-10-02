@@ -1,12 +1,13 @@
 {
   "name": "safelight-spektrafilm-support",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Spektrafilm Support extension for SafeLight — real-time, per-pixel spectral film simulation (colour negative, slide and black & white) run live on the GPU.",
   "type": "module",
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:gpu": "node test/gpu/run.cjs"
   },
   "devDependencies": {
     "typescript": "^5.0.0",

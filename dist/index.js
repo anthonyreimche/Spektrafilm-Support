@@ -945,9 +945,20 @@ function K(Q, B = !1) {
       { key: "sfGrainAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Grain" },
       { key: "sfGrainSize", glslType: "float", default: 1.5, range: { min: 0.5, max: 5, step: 0.1 }, label: "Grain Size" }
     ],
+    // Integer PCG hash (Jarzynski & Olano 2020), not fract(sin(dot(p, k)) * big):
+    // within a few hundred cells the float32 sin argument loses the fractional
+    // bits that hash relies on, and the lattice runs to tens of thousands, so it
+    // collapsed into a periodic cross-hatch on every GPU. Explicit highp because
+    // fragment ints default to mediump (16-bit on some GPUs).
     helpers: `
+      highp uint sfPcg(highp uint v) {
+        highp uint s = v * 747796405u + 2891336453u;
+        highp uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+        return (w >> 22u) ^ w;
+      }
       float sfHash1(vec2 p) {
-        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+        highp uvec2 q = uvec2(ivec2(p));
+        return float(sfPcg(q.x + sfPcg(q.y)) >> 8u) * (1.0 / 16777216.0);
       }
       float sfValNoise(vec2 p) {
         vec2 i = floor(p); vec2 f = fract(p); f = f * f * (3.0 - 2.0 * f);
@@ -1214,6 +1225,7 @@ function jA() {
 }
 export {
   wA as activate,
+  K as buildGrainStage,
   jA as deactivate
 };
 //# sourceMappingURL=index.js.map
