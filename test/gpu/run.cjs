@@ -1,10 +1,10 @@
-// Runs the GPU spec (grain.webgl.test.ts) through a SafeLight checkout's
+// Runs the GPU specs (test/gpu/*.webgl.test.ts) through a SafeLight checkout's
 // WebGL test harness — headless Chromium on SwiftShader and the real renderer —
-// so the grain is checked where only a real driver can show it: float32 hash
-// precision at large lattice coordinates and compilation inside the host's
-// monolithic shader.
+// so the stages are checked where only a real driver can show it: float32 hash
+// precision at large lattice coordinates, compilation inside the host's
+// monolithic shader, and what the host's clipping leaves of an idle effect.
 //
-// The spec is copied into the checkout for the run (its harness helpers and
+// The specs are copied into the checkout for the run (its harness helpers and
 // path aliases only resolve from inside) and removed again afterwards, along
 // with the generated config. Point SAFELIGHT_CORE at the checkout; by default
 // a `SafeLight` directory beside this repository or beside its parent folder
@@ -31,7 +31,7 @@ if (!core) {
 }
 
 const specDir = path.join(core, "src", "rendering", "webgl", "__sf_gpu__");
-const specFile = path.join(specDir, "grain.webgl.test.ts");
+const specs = fs.readdirSync(__dirname).filter((f) => f.endsWith(".webgl.test.ts"));
 const configFile = path.join(core, "vitest.sf-gpu.config.ts");
 const executablePath = process.env.SAFELIGHT_TEST_CHROME;
 
@@ -99,7 +99,7 @@ async function main() {
   let status = 1;
   try {
     fs.mkdirSync(specDir, { recursive: true });
-    fs.copyFileSync(path.join(__dirname, "grain.webgl.test.ts"), specFile);
+    for (const spec of specs) fs.copyFileSync(path.join(__dirname, spec), path.join(specDir, spec));
     fs.writeFileSync(configFile, config(port));
     const result = spawnSync("npx", ["vitest", "run", "--config", path.basename(configFile), "--reporter=verbose"], {
       cwd: core,

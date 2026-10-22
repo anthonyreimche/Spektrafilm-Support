@@ -45,9 +45,12 @@ The stage runs at the `tone-map` phase on scene-linear `lin` and writes
 scene-linear print colour.
 
 > **Select the "Spektrafilm" rendering transform** (Preferences ▸ Rendering).
-> The extension registers it — a plain encode with the RAW base curve off — as
-> the correct view transform: the film stock *is* the tone rendering, so AgX/ACES
-> would tone-map on top of it.
+> The extension registers it — a plain encode with the RAW base curve and the
+> core highlight shoulder off — as the correct view transform: the film stock
+> *is* the tone rendering, so AgX/ACES would tone-map on top of it. Since 2.3.0
+> the film stage gets the scene's full highlight range on photos at Safelight's
+> current processing; older edits keep the shoulder. Without a stock picked the
+> transform clips highlights hard, so pick a stock with it.
 
 ## Controls
 

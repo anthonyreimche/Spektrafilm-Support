@@ -51,6 +51,10 @@ interface ProcessingStageContribution {
   uniforms: UniformDeclaration[];
   passes?: StagePass[];
   textures?: TextureRequirement[];
+  // Omitted, a display-phase stage is handed `c` clipped to [0, 1] on process
+  // version 2, the clip written ahead of its block and outside its own gate.
+  // Hosts before process versions ignore it.
+  space?: { encoding: "linear" | "perceptual"; primaries?: "rec709" | "rec2020" };
 }
 
 interface StageTextureData {
@@ -67,12 +71,14 @@ interface PipelineContribution {
   description?: string;
   glsl?: string;
   skipBaseCurve?: boolean;
+  skipToneShoulder?: boolean;
 }
 
 interface SafelightAPI {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   react: any;
   registerProcessingStage(c: ProcessingStageContribution): void;
+  unregisterProcessingStage(id: string): void;
   setStageTexture(stageId: string, key: string, tex: StageTextureData | null): void;
   registerPipeline(c: PipelineContribution): void;
   registerPanel(c: {
@@ -180,8 +186,10 @@ function buildStage(stock: FilmStockData): ProcessingStageContribution {
 // always respond and there's nothing to fall back. Threshold isolates highlights;
 // Amount screen-blends the tinted glow over the film output `c` (bright areas
 // barely change, so the halo spreads into darker surroundings). Default amount
-// 0 → off until dialled in.
-function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContribution {
+// 0 → off until dialled in: the block is skipped and `c` passes through with its
+// full range. The stage declares the display's own space, so the host adds no
+// clip of its own; the screen blend clips `c` once Amount is up.
+export function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContribution {
   const lumaW = "vec3(0.2126, 0.7152, 0.0722)";
   // B&W desaturates the blurred highlights so the halo is neutral grey; colour
   // stocks keep the source colour and tint it by the stock's halation balance.
@@ -192,6 +200,7 @@ function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContributi
     name: "Halation",
     phase: "effects",
     priority: 50,
+    space: { encoding: "perceptual" },
     uniforms: [
       { key: "sfHalAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Halation" },
       // Size = blur LOD into the source mip chain (0 = sharp highlights, 8 = very
@@ -202,15 +211,17 @@ function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContributi
       { key: "sfHalThreshold", glslType: "float", default: 0.6, range: { min: 0, max: 2, step: 0.01 }, label: "Threshold" },
     ],
     glsl: `
-      vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
-      ${desat}
-      vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
-      // Gain (×4): the mip blur box-averages, so a highlight's energy is diluted by
-      // its surroundings — a unit of Amount needs a multiplier to read. ×4 puts the
-      // useful range around a natural halo; the screen-blend keeps bright areas from
-      // blowing out, so it glows into darker surroundings rather than washing.
-      vec3 hgl = clamp(sfHalAmount * 4.0 * ${tint} * sfHi, 0.0, 1.0);
-      c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);`,
+      if (sfHalAmount > 0.0) {
+        vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
+        ${desat}
+        vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
+        // Gain (×4): the mip blur box-averages, so a highlight's energy is diluted by
+        // its surroundings — a unit of Amount needs a multiplier to read. ×4 puts the
+        // useful range around a natural halo; the screen-blend keeps bright areas from
+        // blowing out, so it glows into darker surroundings rather than washing.
+        vec3 hgl = clamp(sfHalAmount * 4.0 * ${tint} * sfHi, 0.0, 1.0);
+        c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);
+      }`,
   };
 }
 
@@ -223,7 +234,10 @@ function buildHalationStage(fx: FilmFx, mono = false): ProcessingStageContributi
 // aspect-corrected coordinates (srcUv × uImageAspect) anchored to GRAIN_REF, so
 // the grain is a CONSTANT size at any output resolution — Develop, thumbnail and
 // export match (gl_FragCoord, the old coordinate, scaled with the render size and
-// made grain coarser on small thumbnails). Default amount 0 → off until dialled in.
+// made grain coarser on small thumbnails). Default amount 0 → off until dialled in:
+// the block is skipped and `c` passes through with its full range. The stage
+// declares the display's own space, so the host adds no clip of its own; the
+// block clips `c` to [0, 1] itself, which the midtone envelope needs.
 export function buildGrainStage(fx: FilmFx, mono = false): ProcessingStageContribution {
   // Normalise per-channel scale to mean 1 so it only sets RELATIVE coarseness
   // (overall size stays on the Size slider); larger scale → coarser → fewer cells.
@@ -245,6 +259,7 @@ export function buildGrainStage(fx: FilmFx, mono = false): ProcessingStageContri
     name: "Grain",
     phase: "effects",
     priority: 60,
+    space: { encoding: "perceptual" },
     uniforms: [
       { key: "sfGrainAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Grain" },
       { key: "sfGrainSize", glslType: "float", default: 1.5, range: { min: 0.5, max: 5, step: 0.1 }, label: "Grain Size" },
@@ -277,15 +292,18 @@ export function buildGrainStage(fx: FilmFx, mono = false): ProcessingStageContri
         return clamp(0.5 + (a - 0.5) * 0.55 + (b - 0.5) * 0.85, 0.0, 1.0);
       }`,
     glsl: `
-      // Frame-relative, square-celled, resolution-independent grain coordinate.
-      vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${GRAIN_REF}.0 / max(sfGrainSize, 0.5));
-      // Per-channel coarseness (÷scale) + a per-channel offset so the three
-      // channels are independent (coloured grain), not one luminance grain tinted.
-      // B&W stocks override this with a single shared noise (monochrome grain).
-      ${grainNoise}
-      float glum = dot(c, vec3(0.2126, 0.7152, 0.0722));
-      float genv = 2.0 * sqrt(max(glum * (1.0 - glum), 0.0));
-      c += sfGrainAmount * genv * gn;`,
+      if (sfGrainAmount > 0.0) {
+        c = clamp(c, 0.0, 1.0);
+        // Frame-relative, square-celled, resolution-independent grain coordinate.
+        vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${GRAIN_REF}.0 / max(sfGrainSize, 0.5));
+        // Per-channel coarseness (÷scale) + a per-channel offset so the three
+        // channels are independent (coloured grain), not one luminance grain tinted.
+        // B&W stocks override this with a single shared noise (monochrome grain).
+        ${grainNoise}
+        float glum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        float genv = 2.0 * sqrt(max(glum * (1.0 - glum), 0.0));
+        c += sfGrainAmount * genv * gn;
+      }`,
   };
 }
 
@@ -317,13 +335,15 @@ function stockIdFromBag(bag: Record<string, unknown>): string {
 
 function applyStock(api: SafelightAPI, id: string): void {
   if (id === NONE_ID) {
-    // Off: re-register all three stages as no-ops (empty glsl leaves scene-linear
-    // `lin` untouched, regardless of any slider values) and drop the spectral
-    // textures so nothing stays resident. The extension is fully inert until a
-    // stock is chosen again.
-    api.registerProcessingStage({ id: STAGE_ID, name: "Spektrafilm", phase: "tone-map", uniforms: [], glsl: "" });
-    api.registerProcessingStage({ id: HAL_ID, name: "Halation", phase: "effects", priority: 50, uniforms: [], glsl: "" });
-    api.registerProcessingStage({ id: GRAIN_ID, name: "Grain", phase: "effects", priority: 60, uniforms: [], glsl: "" });
+    // Off: unregister all three stages and drop the spectral textures so nothing
+    // stays resident. A registered stage stays in the compiled program even with
+    // empty glsl, and on process version 2 the host clips the display colour
+    // ahead of an effects stage that declares no space, so a no-op registration
+    // would still clip every photo. The extension is fully inert until a stock is
+    // chosen again.
+    api.unregisterProcessingStage(STAGE_ID);
+    api.unregisterProcessingStage(HAL_ID);
+    api.unregisterProcessingStage(GRAIN_ID);
     api.setStageTexture(STAGE_ID, "filmTc", null);
     api.setStageTexture(STAGE_ID, "filmCurves", null);
     api.setStageTexture(STAGE_ID, "filmSpec", null);
@@ -504,9 +524,13 @@ export function activate(api: SafelightAPI): void {
     id: "spektrafilm-support.transform",
     name: "Spektrafilm",
     description:
-      "Plain sRGB encode with the RAW base curve off — the correct view transform for the Spektrafilm film stage (the film provides the tone rendering).",
+      "Plain sRGB encode with the RAW base curve and highlight shoulder off — the correct view transform for the Spektrafilm film stage (the film provides the tone rendering).",
     glsl: "vec3 pipelineToDisplay(vec3 lin) { return linearToSrgbU(lin); }",
     skipBaseCurve: true,
+    // The film's characteristic curve rolls off the highlights, so the film stage
+    // gets the scene's headroom instead of values the core shoulder already
+    // squeezed under white (current processing only; older edits keep the shoulder).
+    skipToneShoulder: true,
   });
 
   function SpektrafilmPanel() {

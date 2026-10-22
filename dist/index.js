@@ -909,6 +909,7 @@ function h(Q, B = !1) {
     name: "Halation",
     phase: "effects",
     priority: 50,
+    space: { encoding: "perceptual" },
     uniforms: [
       { key: "sfHalAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Halation" },
       // Size = blur LOD into the source mip chain (0 = sharp highlights, 8 = very
@@ -919,15 +920,17 @@ function h(Q, B = !1) {
       { key: "sfHalThreshold", glslType: "float", default: 0.6, range: { min: 0, max: 2, step: 0.01 }, label: "Threshold" }
     ],
     glsl: `
-      vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
-      ${E}
-      vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
-      // Gain (×4): the mip blur box-averages, so a highlight's energy is diluted by
-      // its surroundings — a unit of Amount needs a multiplier to read. ×4 puts the
-      // useful range around a natural halo; the screen-blend keeps bright areas from
-      // blowing out, so it glows into darker surroundings rather than washing.
-      vec3 hgl = clamp(sfHalAmount * 4.0 * ${U} * sfHi, 0.0, 1.0);
-      c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);`
+      if (sfHalAmount > 0.0) {
+        vec3 sfBlur = textureLod(uImage, srcUv, clamp(sfHalSize, 0.0, 8.0)).rgb;
+        ${E}
+        vec3 sfHi = max(sfBlur - sfHalThreshold, 0.0);
+        // Gain (×4): the mip blur box-averages, so a highlight's energy is diluted by
+        // its surroundings — a unit of Amount needs a multiplier to read. ×4 puts the
+        // useful range around a natural halo; the screen-blend keeps bright areas from
+        // blowing out, so it glows into darker surroundings rather than washing.
+        vec3 hgl = clamp(sfHalAmount * 4.0 * ${U} * sfHi, 0.0, 1.0);
+        c = 1.0 - (1.0 - clamp(c, 0.0, 1.0)) * (1.0 - hgl);
+      }`
   };
 }
 function K(Q, B = !1) {
@@ -941,6 +944,7 @@ function K(Q, B = !1) {
     name: "Grain",
     phase: "effects",
     priority: 60,
+    space: { encoding: "perceptual" },
     uniforms: [
       { key: "sfGrainAmount", glslType: "float", default: 0, range: { min: 0, max: 1, step: 0.01 }, label: "Grain" },
       { key: "sfGrainSize", glslType: "float", default: 1.5, range: { min: 0.5, max: 5, step: 0.1 }, label: "Grain Size" }
@@ -973,15 +977,18 @@ function K(Q, B = !1) {
         return clamp(0.5 + (a - 0.5) * 0.55 + (b - 0.5) * 0.85, 0.0, 1.0);
       }`,
     glsl: `
-      // Frame-relative, square-celled, resolution-independent grain coordinate.
-      vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${v}.0 / max(sfGrainSize, 0.5));
-      // Per-channel coarseness (÷scale) + a per-channel offset so the three
-      // channels are independent (coloured grain), not one luminance grain tinted.
-      // B&W stocks override this with a single shared noise (monochrome grain).
-      ${U}
-      float glum = dot(c, vec3(0.2126, 0.7152, 0.0722));
-      float genv = 2.0 * sqrt(max(glum * (1.0 - glum), 0.0));
-      c += sfGrainAmount * genv * gn;`
+      if (sfGrainAmount > 0.0) {
+        c = clamp(c, 0.0, 1.0);
+        // Frame-relative, square-celled, resolution-independent grain coordinate.
+        vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${v}.0 / max(sfGrainSize, 0.5));
+        // Per-channel coarseness (÷scale) + a per-channel offset so the three
+        // channels are independent (coloured grain), not one luminance grain tinted.
+        // B&W stocks override this with a single shared noise (monochrome grain).
+        ${U}
+        float glum = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        float genv = 2.0 * sqrt(max(glum * (1.0 - glum), 0.0));
+        c += sfGrainAmount * genv * gn;
+      }`
   };
 }
 let w = null, W = 1;
@@ -999,7 +1006,7 @@ function x(Q) {
 }
 function _(Q, B) {
   if (B === M) {
-    Q.registerProcessingStage({ id: k, name: "Spektrafilm", phase: "tone-map", uniforms: [], glsl: "" }), Q.registerProcessingStage({ id: q, name: "Halation", phase: "effects", priority: 50, uniforms: [], glsl: "" }), Q.registerProcessingStage({ id: o, name: "Grain", phase: "effects", priority: 60, uniforms: [], glsl: "" }), Q.setStageTexture(k, "filmTc", null), Q.setStageTexture(k, "filmCurves", null), Q.setStageTexture(k, "filmSpec", null);
+    Q.unregisterProcessingStage(k), Q.unregisterProcessingStage(q), Q.unregisterProcessingStage(o), Q.setStageTexture(k, "filmTc", null), Q.setStageTexture(k, "filmCurves", null), Q.setStageTexture(k, "filmSpec", null);
     return;
   }
   const D = j.find((T) => T.id === B) ?? j[0], E = D.kind === "bw";
@@ -1112,9 +1119,13 @@ function wA(Q) {
   Q.registerPipeline({
     id: "spektrafilm-support.transform",
     name: "Spektrafilm",
-    description: "Plain sRGB encode with the RAW base curve off — the correct view transform for the Spektrafilm film stage (the film provides the tone rendering).",
+    description: "Plain sRGB encode with the RAW base curve and highlight shoulder off — the correct view transform for the Spektrafilm film stage (the film provides the tone rendering).",
     glsl: "vec3 pipelineToDisplay(vec3 lin) { return linearToSrgbU(lin); }",
-    skipBaseCurve: !0
+    skipBaseCurve: !0,
+    // The film's characteristic curve rolls off the highlights, so the film stage
+    // gets the scene's headroom instead of values the core shoulder already
+    // squeezed under white (current processing only; older edits keep the shoulder).
+    skipToneShoulder: !0
   });
   function D() {
     const E = Q.components.Slider, U = Q.stores.useDevelopStore, T = U((P) => P.paramBag), F = U((P) => P.setDynParam), [g, N] = B.useState({ film: !0, halation: !1, grain: !1 }), O = x(T);
@@ -1226,6 +1237,7 @@ function jA() {
 export {
   wA as activate,
   K as buildGrainStage,
+  h as buildHalationStage,
   jA as deactivate
 };
 //# sourceMappingURL=index.js.map
