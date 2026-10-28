@@ -1,4 +1,4 @@
-const n = `
+const m = `
 const float SF_LN10 = 2.302585093;
 
 float sf_pow10neg(float x) { return exp(-x * SF_LN10); }   // 10^(-x)
@@ -40,9 +40,32 @@ vec3 sf_gamut_compress(vec3 rgb) {
   vec3 dc = sf_reinhard_knee(d, 0.0, 1.0, 6.0);
   return vec3(ach) * (1.0 - dc);
 }
-`, S = `
+`, f = `
+  // ── Mask copies ──
+  // A mask's copy of this stage runs right after it, on the print the stage
+  // left in lin; developing that again would print a print. So the stage hands
+  // on the scene it developed and its own settings, and a copy, whose isv
+  // values start out as the stage's, develops that scene with its mask's
+  // settings on top: exposure and filtration add, print exposure, coupler
+  // amount and contrast multiply. The stage itself finds them unset.
+  bool sfCopy = isv_spektrafilmScene.w > 0.0;
+  if (!sfCopy) {
+    isv_spektrafilmScene = vec4(lin, 1.0);
+    isv_spektrafilmLive = vec4(sfExposure, sfPrintExp, sfCouplerAmt, sfContrast);
+    isv_spektrafilmFilt = vec2(sfFiltM, sfFiltY);
+  }
+  vec3 sfScene = isv_spektrafilmScene.rgb;
+  vec4 sfBase = sfCopy ? isv_spektrafilmLive : vec4(0.0, 1.0, 1.0, 1.0);
+  vec2 sfBaseFilt = sfCopy ? isv_spektrafilmFilt : vec2(0.0);
+  float sfEv = sfBase.x + sfExposure;
+  float sfPrintGain = sfBase.y * sfPrintExp;
+  float sfCoupler = sfBase.z * sfCouplerAmt;
+  float sfGrade = sfBase.w * sfContrast;
+  float sfCcM = sfBaseFilt.x + sfFiltM;
+  float sfCcY = sfBaseFilt.y + sfFiltY;
+
   // ── Stage 1: expose ──
-  vec3 sfXyz = sf_apply(max(lin, 0.0) * exp2(sfExposure), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
+  vec3 sfXyz = sf_apply(max(sfScene, 0.0) * exp2(sfEv), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
   float sfB = max(sfXyz.x + sfXyz.y + sfXyz.z, 1e-10);
   vec2 sfTc = sf_tri2quad(sfXyz.xy / sfB);
   // filmTc is row-major tc_lut[i=tc.x][j=tc.y]; texture() maps .x→column/.y→row,
@@ -51,21 +74,21 @@ vec3 sf_gamut_compress(vec3 rgb) {
   vec3 sfLogf = log2(max(sfRaw, 0.0) + 1e-10) * 0.301029996;   // log10
 
   // ── Stage 2: develop (curves + DIR couplers) ──
-  // sfCouplerAmt scales the DIR-coupler cross-talk (1.0 = engine default, 0 =
-  // couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
+  // The coupler amount scales the DIR-coupler cross-talk (1.0 = engine default,
+  // 0 = couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
   vec3 sfDens = sf_curve(filmCurves, 0.0, sfLeFilm, sfLogf);             // norm_dc
   // Reversal (slide) film releases the coupler inhibitor from the SILVER image
   // (sfDensMax − developed dye), negative film from the dye density itself. The
   // before-couplers curve (dc0) already bakes the positive inversion; only this
   // live donor term differs between the two paths.
   vec3 sfSilver = sfPositive ? (sfDensMax - sfDens) : sfDens;
-  vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
+  vec3 sfLog0 = sfLogf - sfCoupler * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
   if (sfPositive) {
     // Slides have no print to grade, so Print Contrast becomes a film-curve
     // contrast: warp developed log-exposure around the film midpoint (1.0 = the
     // engine's straight reversal curve; >1 harder, <1 softer).
     float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
-    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
+    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfGrade;
   }
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
@@ -87,9 +110,9 @@ vec3 sf_gamut_compress(vec3 rgb) {
     // dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the wavelength-
     // independent t terms hoist out; M/Y dichroic spectra ride in the print/scan
     // kernel alpha lanes.
-    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
+    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfCcM) * 0.01);
     float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
-    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
+    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfCcY) * 0.01);
     float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
     vec3 sfRawP = vec3(0.0);
     for (int i = 0; i < 81; i++) {
@@ -106,15 +129,15 @@ vec3 sf_gamut_compress(vec3 rgb) {
         sfRawP += sf_pow10neg(dspec) * pk.rgb;
       }
     }
-    sfRawP *= sfFactor * sfPrintExp;
+    sfRawP *= sfFactor * sfPrintGain;
     vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
 
     // ── Stage 4: print-develop ──
-    // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
+    // The contrast warps print log-exposure around the curve midpoint (1.0 = engine
     // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
     // mid-grey put while steepening/flattening the toe and shoulder.
     float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
-    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
+    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfGrade;
     sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);              // morphed print
   }
 
@@ -864,12 +887,12 @@ const vec3 sfDensMax = vec3(2.0801281,2.0801281,2.0801281);`,
     filmCurves: () => A("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MzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAAMzMDQDMzA0AzMwNAAAAAADMzA0AzMwNAMzMDQAAAAAAzMwNAMzMDQDMzA0AAAAAA"),
     filmSpec: () => A("q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+q6qqPquqqj7NzMw9q6qqPquqqj6rqqo+zczMPauqqj6rqqo+q6qqPs3MzD2rqqo+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CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9q6qqPquqqj6rqqo+CtcjPauqqj6rqqo+q6qqPgrXIz2rqqo+q6qqPquqqj4K1yM9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")
   }
-], k = "spektrafilm-support.film", q = "spektrafilm-support.halation", o = "spektrafilm-support.grain", M = "none", v = 2700, p = {
+], k = "spektrafilm-support.film", q = "spektrafilm-support.halation", O = "spektrafilm-support.grain", F = "none", b = 2700, L = {
   halTint: [1, 0.33, 0],
   grainScale: [1, 1, 1.5]
-}, m = (Q) => `vec3(${Q.map((B) => B.toFixed(4)).join(", ")})`, f = (Q) => Q.kind === "slide";
-function b(Q) {
-  const B = f(Q);
+}, W = (Q) => `vec3(${Q.map((B) => B.toFixed(4)).join(", ")})`, X = (Q) => Q.kind === "slide";
+function _(Q) {
+  const B = X(Q);
   return {
     id: k,
     name: "Spektrafilm",
@@ -897,13 +920,22 @@ function b(Q) {
     // matrices/ranges. Putting the consts in the body makes s.glsl differ per stock,
     // so switching stock recompiles with the right consts — cheap and rare, and the
     // intended behaviour. Live params stay uniforms.
-    helpers: n,
+    helpers: m,
     glsl: Q.consts + `
-` + S
+` + f,
+    // The scene and settings a mask's copy develops again (see FILM_GLSL).
+    produces: [
+      { name: "spektrafilmScene", glslType: "vec4" },
+      { name: "spektrafilmLive", glslType: "vec4" },
+      { name: "spektrafilmFilt", glslType: "vec2" }
+    ],
+    // A mask's copy shares this stage's spectral textures and baked constants,
+    // so a mask changes the photo's stock's settings, never the stock.
+    mask: { maskable: !0 }
   };
 }
-function h(Q, B = !1) {
-  const E = B ? "sfBlur = vec3(dot(max(sfBlur, 0.0), vec3(0.2126, 0.7152, 0.0722)));" : "", U = B ? "vec3(1.0)" : m(Q.halTint);
+function d(Q, B = !1) {
+  const E = B ? "sfBlur = vec3(dot(max(sfBlur, 0.0), vec3(0.2126, 0.7152, 0.0722)));" : "", U = B ? "vec3(1.0)" : W(Q.halTint);
   return {
     id: q,
     name: "Halation",
@@ -933,14 +965,14 @@ function h(Q, B = !1) {
       }`
   };
 }
-function K(Q, B = !1) {
-  const D = (Q.grainScale[0] + Q.grainScale[1] + Q.grainScale[2]) / 3 || 1, E = Q.grainScale.map((T) => (T / D).toFixed(4)), U = B ? "vec3 gn = vec3(sfGrain2(gbase) - 0.5);" : `vec3 gn = vec3(
+function Z(Q, B = !1) {
+  const D = (Q.grainScale[0] + Q.grainScale[1] + Q.grainScale[2]) / 3 || 1, E = Q.grainScale.map((g) => (g / D).toFixed(4)), U = B ? "vec3 gn = vec3(sfGrain2(gbase) - 0.5);" : `vec3 gn = vec3(
         sfGrain2(gbase / ${E[0]}),
         sfGrain2(gbase / ${E[1]} + vec2(37.0, 11.0)),
         sfGrain2(gbase / ${E[2]} + vec2(91.0, 53.0))
       ) - 0.5;`;
   return {
-    id: o,
+    id: O,
     name: "Grain",
     phase: "effects",
     priority: 60,
@@ -980,7 +1012,7 @@ function K(Q, B = !1) {
       if (sfGrainAmount > 0.0) {
         c = clamp(c, 0.0, 1.0);
         // Frame-relative, square-celled, resolution-independent grain coordinate.
-        vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${v}.0 / max(sfGrainSize, 0.5));
+        vec2 gbase = vec2(srcUv.x * uImageAspect, srcUv.y) * (${b}.0 / max(sfGrainSize, 0.5));
         // Per-channel coarseness (÷scale) + a per-channel offset so the three
         // channels are independent (coloured grain), not one luminance grain tinted.
         // B&W stocks override this with a single shared noise (monochrome grain).
@@ -991,75 +1023,75 @@ function K(Q, B = !1) {
       }`
   };
 }
-let w = null, W = 1;
-const t = k + ".__stock";
-let c = null, I = null;
-function X(Q) {
-  if (Q === M) return -1;
+let w = null, $ = 1;
+const R = k + ".__stock";
+let s = null, I = null;
+function AA(Q) {
+  if (Q === F) return -1;
   const B = j.findIndex((D) => D.id === Q);
   return B >= 0 ? B : 0;
 }
-function x(Q) {
+function V(Q) {
   var D;
-  const B = Q[t];
-  return typeof B == "number" ? B < 0 ? M : ((D = j[B]) == null ? void 0 : D.id) ?? M : M;
+  const B = Q[R];
+  return typeof B == "number" ? B < 0 ? F : ((D = j[B]) == null ? void 0 : D.id) ?? F : F;
 }
-function _(Q, B) {
-  if (B === M) {
-    Q.unregisterProcessingStage(k), Q.unregisterProcessingStage(q), Q.unregisterProcessingStage(o), Q.setStageTexture(k, "filmTc", null), Q.setStageTexture(k, "filmCurves", null), Q.setStageTexture(k, "filmSpec", null);
+function QA(Q, B) {
+  if (B === F) {
+    Q.unregisterProcessingStage(k), Q.unregisterProcessingStage(q), Q.unregisterProcessingStage(O), Q.setStageTexture(k, "filmTc", null), Q.setStageTexture(k, "filmCurves", null), Q.setStageTexture(k, "filmSpec", null);
     return;
   }
-  const D = j.find((T) => T.id === B) ?? j[0], E = D.kind === "bw";
-  Q.registerProcessingStage(b(D)), Q.registerProcessingStage(h(D.fx, E)), Q.registerProcessingStage(K(D.fx, E));
-  const U = ++W;
+  const D = j.find((g) => g.id === B) ?? j[0], E = D.kind === "bw";
+  Q.registerProcessingStage(_(D)), Q.registerProcessingStage(d(D.fx, E)), Q.registerProcessingStage(Z(D.fx, E));
+  const U = ++$;
   Q.setStageTexture(k, "filmTc", { data: D.filmTc(), width: D.tcSize, height: D.tcSize, format: "rgba16f", version: U }), Q.setStageTexture(k, "filmCurves", { data: D.filmCurves(), width: 256, height: 3, format: "rgba16f", version: U }), Q.setStageTexture(k, "filmSpec", { data: D.filmSpec(), width: 81, height: 4, format: "rgba16f", version: U });
 }
-function J(Q, B) {
-  const D = x(B);
-  D !== c && (c = D, _(Q, D));
+function o(Q, B) {
+  const D = V(B);
+  D !== s && (s = D, QA(Q, D));
 }
-const l = [
+const p = [
   { stage: k, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
   { stage: k, key: "sfPrintExp", label: "Print Exposure", min: 0.2, max: 3, dflt: 1, step: 0.01 },
   { stage: k, key: "sfCouplerAmt", label: "Coupler Amount", min: 0, max: 2, dflt: 1, step: 0.01 },
   { stage: k, key: "sfContrast", label: "Print Contrast", min: 0.5, max: 2, dflt: 1, step: 0.01 },
   { stage: k, key: "sfFiltM", label: "Filtration M", min: -100, max: 100, dflt: 0, step: 1 },
   { stage: k, key: "sfFiltY", label: "Filtration Y", min: -100, max: 100, dflt: 0, step: 1 }
-], $ = [
+], PA = [
   { stage: k, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
   { stage: k, key: "sfCouplerAmt", label: "Coupler Amount", min: 0, max: 2, dflt: 1, step: 0.01 },
   { stage: k, key: "sfContrast", label: "Contrast", min: 0.5, max: 2, dflt: 1, step: 0.01 }
-], AA = [
+], BA = [
   { stage: k, key: "sfExposure", label: "Exposure", min: -3, max: 3, dflt: 0, step: 0.01 },
   { stage: k, key: "sfPrintExp", label: "Print Exposure", min: 0.2, max: 3, dflt: 1, step: 0.01 },
   { stage: k, key: "sfContrast", label: "Paper Grade", min: 0.5, max: 2, dflt: 1, step: 0.01 }
-], L = [
+], r = [
   { stage: q, key: "sfHalAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
   { stage: q, key: "sfHalSize", label: "Size", min: 0, max: 8, dflt: 4, step: 0.1 },
   { stage: q, key: "sfHalThreshold", label: "Threshold", min: 0, max: 2, dflt: 0.6, step: 0.01 }
-], d = [
-  { stage: o, key: "sfGrainAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
-  { stage: o, key: "sfGrainSize", label: "Size", min: 0.5, max: 5, dflt: 1.5, step: 0.1 }
+], e = [
+  { stage: O, key: "sfGrainAmount", label: "Amount", min: 0, max: 1, dflt: 0, step: 0.01 },
+  { stage: O, key: "sfGrainSize", label: "Size", min: 0.5, max: 5, dflt: 1.5, step: 0.1 }
 ];
-function QA(Q) {
-  return Q === "slide" ? $ : Q === "bw" ? AA : l;
+function DA(Q) {
+  return Q === "slide" ? PA : Q === "bw" ? BA : p;
 }
-function PA(Q) {
+function EA(Q) {
   return [
-    { id: "film", title: "Film", hint: Q === "slide" ? "Slide exposure, development and contrast (reversal film, scanned directly — no enlarger print)." : Q === "bw" ? "Darkroom black & white: film exposure, print exposure (print lightness) and paper grade (contrast)." : "Negative exposure, enlarger print, development and live colour-head filtration.", ctrls: QA(Q) },
-    { id: "halation", title: "Halation", hint: "Back-reflection highlight glow, tinted to the selected stock. Off at 0.", ctrls: L },
-    { id: "grain", title: "Grain", hint: "Midtone-peaked, per-channel film grain at the stock's coarseness. Off at 0.", ctrls: d }
+    { id: "film", title: "Film", hint: Q === "slide" ? "Slide exposure, development and contrast (reversal film, scanned directly — no enlarger print)." : Q === "bw" ? "Darkroom black & white: film exposure, print exposure (print lightness) and paper grade (contrast)." : "Negative exposure, enlarger print, development and live colour-head filtration.", ctrls: DA(Q) },
+    { id: "halation", title: "Halation", hint: "Back-reflection highlight glow, tinted to the selected stock. Off at 0.", ctrls: r },
+    { id: "grain", title: "Grain", hint: "Midtone-peaked, per-channel film grain at the stock's coarseness. Off at 0.", ctrls: e }
   ];
 }
-const BA = Object.fromEntries(
-  [...l, ...L, ...d].map((Q) => [`${Q.stage}.${Q.key}`, Q.dflt])
+const CA = Object.fromEntries(
+  [...p, ...r, ...e].map((Q) => [`${Q.stage}.${Q.key}`, Q.dflt])
 );
-function DA(Q) {
-  Q.stores.useDevelopStore.getState().setDynParams({ ...BA, [t]: -1 }), J(Q, Q.stores.useDevelopStore.getState().paramBag), Q.stores.useDevelopStore.getState().commitEdit("Spektrafilm Reset");
+function kA(Q) {
+  Q.stores.useDevelopStore.getState().setDynParams({ ...CA, [R]: -1 }), o(Q, Q.stores.useDevelopStore.getState().paramBag), Q.stores.useDevelopStore.getState().commitEdit("Spektrafilm Reset");
 }
-const EA = "https://github.com/andreavolpato/spektrafilm", CA = "https://github.com/anthonyreimche/Spektrafilm-Support-for-Safelight#adding-your-own-stocks", kA = `python tools/extract_stock.py --emit
+const UA = "https://github.com/andreavolpato/spektrafilm", zA = "https://github.com/anthonyreimche/Spektrafilm-Support-for-Safelight#adding-your-own-stocks", wA = `python tools/extract_stock.py --emit
 npm run build`;
-function UA({ React: Q }) {
+function jA({ React: Q }) {
   const [B, D] = Q.useState(!1), E = Q.createElement, U = {
     display: "block",
     width: "100%",
@@ -1068,16 +1100,16 @@ function UA({ React: Q }) {
     cursor: "pointer",
     border: "none",
     marginTop: 2
-  }, T = (g, N) => E("a", {
-    href: g,
+  }, g = (M, N) => E("a", {
+    href: M,
     target: "_blank",
     rel: "noreferrer",
     className: "rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary hover:bg-surface-3",
     style: U
-  }, N), F = (g, N) => E(
+  }, N), T = (M, N) => E(
     "div",
     { style: { display: "flex", gap: 6 } },
-    E("span", { className: "text-text-secondary" }, `${g}.`),
+    E("span", { className: "text-text-secondary" }, `${M}.`),
     E("span", { className: "text-text-primary" }, N)
   );
   return E(
@@ -1089,33 +1121,33 @@ function UA({ React: Q }) {
       { style: { lineHeight: 1.4, margin: 0 } },
       "No film-stock data is bundled. Spektrafilm's looks are generated offline from the spectral engine, then baked into the extension. To get started:"
     ),
-    F(1, "Install the Spektrafilm engine (pip-installable, Python 3.13)."),
-    F(2, "Run the extractor to generate the film stocks."),
-    F(3, "Rebuild the extension and reload it."),
+    T(1, "Install the Spektrafilm engine (pip-installable, Python 3.13)."),
+    T(2, "Run the extractor to generate the film stocks."),
+    T(3, "Rebuild the extension and reload it."),
     E(
       "button",
       {
         className: "rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary hover:bg-surface-3",
         style: U,
         onClick: () => {
-          var g;
-          (g = navigator.clipboard) == null || g.writeText(kA), D(!0), setTimeout(() => D(!1), 1500);
+          var M;
+          (M = navigator.clipboard) == null || M.writeText(wA), D(!0), setTimeout(() => D(!1), 1500);
         }
       },
       B ? "Copied ✓" : "Copy generate command"
     ),
-    T(EA, "Spektrafilm engine (GitHub) ↗"),
-    T(CA, "Setup guide ↗")
+    g(UA, "Spektrafilm engine (GitHub) ↗"),
+    g(zA, "Setup guide ↗")
   );
 }
-function wA(Q) {
+function gA(Q) {
   w = Q;
   const B = Q.react;
   if (j.length > 0) {
     const E = Q.stores.useDevelopStore;
-    J(Q, E.getState().paramBag ?? {}), I = E.subscribe((U) => J(Q, (U == null ? void 0 : U.paramBag) ?? {}));
+    o(Q, E.getState().paramBag ?? {}), I = E.subscribe((U) => o(Q, (U == null ? void 0 : U.paramBag) ?? {}));
   } else
-    Q.registerProcessingStage(h(p)), Q.registerProcessingStage(K(p));
+    Q.registerProcessingStage(d(L)), Q.registerProcessingStage(Z(L));
   Q.registerPipeline({
     id: "spektrafilm-support.transform",
     name: "Spektrafilm",
@@ -1128,49 +1160,45 @@ function wA(Q) {
     skipToneShoulder: !0
   });
   function D() {
-    const E = Q.components.Slider, U = Q.stores.useDevelopStore, T = U((P) => P.paramBag), F = U((P) => P.setDynParam), [g, N] = B.useState({ film: !0, halation: !1, grain: !1 }), O = x(T);
+    const E = Q.components.Slider, U = Q.stores.useDevelopStore, g = U((P) => P.paramBag), T = Q.develop.useParamScope(), M = T.maskId !== null, N = T.getParams(), [Y, a] = B.useState({ film: !0, halation: !1, grain: !1 }), H = V(g);
     if (j.length === 0)
-      return B.createElement(UA, { React: B });
-    const z = B.createElement, H = () => {
-      U.getState().commitEdit("Spektrafilm");
-    }, s = (P) => {
-      const C = T[`${P.stage}.${P.key}`];
+      return B.createElement(jA, { React: B });
+    const z = B.createElement, G = () => T.commit("Spektrafilm"), h = (P) => {
+      const C = N[`${P.stage}.${P.key}`];
       return typeof C == "number" ? C : P.dflt;
-    }, Z = (P) => z(E, {
+    }, u = (P) => z(E, {
       key: P.key,
       label: P.label,
-      value: s(P),
+      value: h(P),
       min: P.min,
       max: P.max,
       step: P.step,
       defaultValue: P.dflt,
-      onChange: (C) => F(`${P.stage}.${P.key}`, C),
-      onCommit: H
-    }), V = (P) => P.ctrls.some((C) => s(C) !== C.dflt), r = (P) => {
-      U.getState().setDynParams(
-        Object.fromEntries(P.ctrls.map((C) => [`${C.stage}.${C.key}`, C.dflt]))
-      ), H();
-    }, e = (P) => {
-      const C = g[P.id], G = z(
+      onChange: (C) => T.setParams({ [`${P.stage}.${P.key}`]: C }),
+      onCommit: G
+    }), i = (P) => P.ctrls.some((C) => h(C) !== C.dflt), n = (P) => {
+      T.setParams(Object.fromEntries(P.ctrls.map((C) => [`${C.stage}.${C.key}`, C.dflt]))), G();
+    }, K = (P) => {
+      const C = Y[P.id], t = z(
         "div",
         {
           style: { display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer", marginTop: 4 },
           title: P.hint,
-          onClick: () => N({ ...g, [P.id]: !C })
+          onClick: () => a({ ...Y, [P.id]: !C })
         },
         z(
           "span",
           { className: "text-[11px] text-text-primary", style: { fontWeight: 600 } },
           `${C ? "▾" : "▸"} ${P.title}`
         ),
-        V(P) ? z(
+        i(P) ? z(
           "button",
           {
             className: "rounded bg-surface-2 px-2 py-1 text-[11px] text-text-secondary hover:bg-surface-3",
             style: { border: "none", cursor: "pointer" },
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            onClick: (y) => {
-              y.stopPropagation(), r(P);
+            onClick: (v) => {
+              v.stopPropagation(), n(P);
             }
           },
           "Reset"
@@ -1179,48 +1207,53 @@ function wA(Q) {
       return z(
         "div",
         { key: P.id, className: "flex flex-col gap-1.5" },
-        G,
-        C ? P.ctrls.map(Z) : null
+        t,
+        C ? P.ctrls.map(u) : null
       );
-    }, a = {
+    }, y = {
       negative: "Colour negative",
       cine: "Cinema",
       slide: "Slide / reversal",
       bw: "Black & white"
-    }, u = j.map((P) => P.kind).filter((P, C, G) => G.indexOf(P) === C).map((P) => z(
+    }, S = j.map((P) => P.kind).filter((P, C, t) => t.indexOf(P) === C).map((P) => z(
       "optgroup",
-      { key: P, label: a[P] ?? P },
+      { key: P, label: y[P] ?? P },
       j.filter((C) => C.kind === P).map((C) => z("option", { key: C.id, value: C.id }, C.name))
-    )), R = j.find((P) => P.id === O) ?? j[0], Y = O === M, i = PA(R.kind);
-    return z(
+    )), c = j.find((P) => P.id === H) ?? j[0], J = H === F, x = EA(c.kind), l = (P) => z("p", { className: "text-[11px] text-text-secondary", style: { lineHeight: 1.35, margin: "2px 0 4px" } }, P);
+    return M ? z(
+      "div",
+      { className: "flex flex-col gap-1.5 p-2" },
+      l(J ? "This photo has no film stock yet. Choose one in the Spektrafilm panel, then shape it here." : `Develops the photo's ${c.name} again inside the mask, these settings on top of the photo's. At their defaults the mask matches the photo.`),
+      J ? null : K(x[0])
+    ) : z(
       "div",
       { className: "flex flex-col gap-1.5 p-2" },
       z("label", { className: "text-[11px] text-text-secondary" }, "Film stock"),
       z(
         "select",
         {
-          value: O,
+          value: H,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           onChange: (P) => {
             const C = P.target.value;
-            U.getState().setDynParam(t, X(C)), J(Q, U.getState().paramBag), H();
+            U.getState().setDynParam(R, AA(C)), o(Q, U.getState().paramBag), G();
           },
           className: "w-full rounded bg-surface-2 px-2 py-1 text-[11px] text-text-primary outline-none focus:bg-surface-3"
         },
         // "None" turns the whole extension off; real stocks follow, grouped by family.
-        z("option", { key: M, value: M }, "None (off)"),
-        ...u
+        z("option", { key: F, value: F }, "None (off)"),
+        ...S
       ),
-      Y ? z(
+      J ? z(
         "p",
         { className: "text-[11px] text-text-secondary", style: { lineHeight: 1.35, margin: "4px 0" } },
         "Spektrafilm is off. Choose a film stock to enable it, and switch your rendering transform back from “Spektrafilm”."
       ) : z(
         "p",
         { className: "text-[11px] text-text-secondary", style: { lineHeight: 1.35, margin: "2px 0 4px" } },
-        R.description
+        c.description
       ),
-      Y ? null : i.map(e)
+      J ? null : x.map(K)
     );
   }
   Q.registerPanel({
@@ -1228,16 +1261,20 @@ function wA(Q) {
     title: "Spektrafilm",
     component: D,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
-    onReset: () => DA(Q)
+    onReset: () => kA(Q),
+    // The same panel edits a mask's film settings in the Masking panel's
+    // Adjust tab. Every stock's controls are a subset of the negative's.
+    mask: { component: D, owns: p.map((E) => `${E.stage}.${E.key}`) }
   });
 }
-function jA() {
-  I == null || I(), I = null, c = null, w == null || w.setStageTexture(k, "filmTc", null), w == null || w.setStageTexture(k, "filmCurves", null), w == null || w.setStageTexture(k, "filmSpec", null), w = null;
+function MA() {
+  I == null || I(), I = null, s = null, w == null || w.setStageTexture(k, "filmTc", null), w == null || w.setStageTexture(k, "filmCurves", null), w == null || w.setStageTexture(k, "filmSpec", null), w = null;
 }
 export {
-  wA as activate,
-  K as buildGrainStage,
-  h as buildHalationStage,
-  jA as deactivate
+  gA as activate,
+  Z as buildGrainStage,
+  d as buildHalationStage,
+  _ as buildStage,
+  MA as deactivate
 };
 //# sourceMappingURL=index.js.map

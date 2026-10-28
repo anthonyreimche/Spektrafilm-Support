@@ -83,8 +83,31 @@ vec3 sf_gamut_compress(vec3 rgb) {
  *  colour (the "Spektrafilm" display transform then encodes it). Uniforms +
  *  textures are namespaced by the stage at registration. */
 export const FILM_GLSL = `
+  // ── Mask copies ──
+  // A mask's copy of this stage runs right after it, on the print the stage
+  // left in lin; developing that again would print a print. So the stage hands
+  // on the scene it developed and its own settings, and a copy, whose isv
+  // values start out as the stage's, develops that scene with its mask's
+  // settings on top: exposure and filtration add, print exposure, coupler
+  // amount and contrast multiply. The stage itself finds them unset.
+  bool sfCopy = isv_spektrafilmScene.w > 0.0;
+  if (!sfCopy) {
+    isv_spektrafilmScene = vec4(lin, 1.0);
+    isv_spektrafilmLive = vec4(sfExposure, sfPrintExp, sfCouplerAmt, sfContrast);
+    isv_spektrafilmFilt = vec2(sfFiltM, sfFiltY);
+  }
+  vec3 sfScene = isv_spektrafilmScene.rgb;
+  vec4 sfBase = sfCopy ? isv_spektrafilmLive : vec4(0.0, 1.0, 1.0, 1.0);
+  vec2 sfBaseFilt = sfCopy ? isv_spektrafilmFilt : vec2(0.0);
+  float sfEv = sfBase.x + sfExposure;
+  float sfPrintGain = sfBase.y * sfPrintExp;
+  float sfCoupler = sfBase.z * sfCouplerAmt;
+  float sfGrade = sfBase.w * sfContrast;
+  float sfCcM = sfBaseFilt.x + sfFiltM;
+  float sfCcY = sfBaseFilt.y + sfFiltY;
+
   // ── Stage 1: expose ──
-  vec3 sfXyz = sf_apply(max(lin, 0.0) * exp2(sfExposure), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
+  vec3 sfXyz = sf_apply(max(sfScene, 0.0) * exp2(sfEv), sfRgb2xyz0, sfRgb2xyz1, sfRgb2xyz2);
   float sfB = max(sfXyz.x + sfXyz.y + sfXyz.z, 1e-10);
   vec2 sfTc = sf_tri2quad(sfXyz.xy / sfB);
   // filmTc is row-major tc_lut[i=tc.x][j=tc.y]; texture() maps .x→column/.y→row,
@@ -93,21 +116,21 @@ export const FILM_GLSL = `
   vec3 sfLogf = log2(max(sfRaw, 0.0) + 1e-10) * 0.301029996;   // log10
 
   // ── Stage 2: develop (curves + DIR couplers) ──
-  // sfCouplerAmt scales the DIR-coupler cross-talk (1.0 = engine default, 0 =
-  // couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
+  // The coupler amount scales the DIR-coupler cross-talk (1.0 = engine default,
+  // 0 = couplers off → flatter, less saturated; >1 = stronger inter-layer effect).
   vec3 sfDens = sf_curve(filmCurves, 0.0, sfLeFilm, sfLogf);             // norm_dc
   // Reversal (slide) film releases the coupler inhibitor from the SILVER image
   // (sfDensMax − developed dye), negative film from the dye density itself. The
   // before-couplers curve (dc0) already bakes the positive inversion; only this
   // live donor term differs between the two paths.
   vec3 sfSilver = sfPositive ? (sfDensMax - sfDens) : sfDens;
-  vec3 sfLog0 = sfLogf - sfCouplerAmt * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
+  vec3 sfLog0 = sfLogf - sfCoupler * sf_apply(sfSilver, sfCoup0, sfCoup1, sfCoup2);
   if (sfPositive) {
     // Slides have no print to grade, so Print Contrast becomes a film-curve
     // contrast: warp developed log-exposure around the film midpoint (1.0 = the
     // engine's straight reversal curve; >1 harder, <1 softer).
     float sfFilmMid = 0.5 * (sfLeFilm.x + sfLeFilm.y);
-    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfContrast;
+    sfLog0 = sfFilmMid + (sfLog0 - sfFilmMid) * sfGrade;
   }
   vec3 sfCmyF = sf_curve(filmCurves, 1.0, sfLeFilm, sfLog0);             // dc0
 
@@ -129,9 +152,9 @@ export const FILM_GLSL = `
     // dim = 1-(1-dich)*(1-t), t = 10^(-cc/100) [Kodak CC units]; the wavelength-
     // independent t terms hoist out; M/Y dichroic spectra ride in the print/scan
     // kernel alpha lanes.
-    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfFiltM) * 0.01);
+    float sfTmL = sf_pow10neg((sfNeutralMY.x + sfCcM) * 0.01);
     float sfTmN = sf_pow10neg(sfNeutralMY.x * 0.01);
-    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfFiltY) * 0.01);
+    float sfTyL = sf_pow10neg((sfNeutralMY.y + sfCcY) * 0.01);
     float sfTyN = sf_pow10neg(sfNeutralMY.y * 0.01);
     vec3 sfRawP = vec3(0.0);
     for (int i = 0; i < ${N_WL}; i++) {
@@ -148,15 +171,15 @@ export const FILM_GLSL = `
         sfRawP += sf_pow10neg(dspec) * pk.rgb;
       }
     }
-    sfRawP *= sfFactor * sfPrintExp;
+    sfRawP *= sfFactor * sfPrintGain;
     vec3 sfLogP = log2(max(sfRawP, 0.0) + 1e-10) * 0.301029996;
 
     // ── Stage 4: print-develop ──
-    // sfContrast warps print log-exposure around the curve midpoint (1.0 = engine
+    // The contrast warps print log-exposure around the curve midpoint (1.0 = engine
     // default; >1 = harder paper grade, <1 = softer). Pivoting on the mid keeps
     // mid-grey put while steepening/flattening the toe and shoulder.
     float sfPrintMid = 0.5 * (sfLePrint.x + sfLePrint.y);
-    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfContrast;
+    sfLogP = sfPrintMid + (sfLogP - sfPrintMid) * sfGrade;
     sfCmyP = sf_curve(filmCurves, 2.0, sfLePrint, sfLogP);              // morphed print
   }
 

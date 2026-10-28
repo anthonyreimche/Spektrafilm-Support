@@ -41,6 +41,12 @@ interface StagePass {
   uniforms?: UniformDeclaration[];
 }
 
+interface InterStageVariable {
+  name: string;
+  glslType: "float" | "vec2" | "vec3" | "vec4";
+  producer?: string;
+}
+
 interface ProcessingStageContribution {
   id: string;
   name: string;
@@ -51,6 +57,13 @@ interface ProcessingStageContribution {
   uniforms: UniformDeclaration[];
   passes?: StagePass[];
   textures?: TextureRequirement[];
+  // Values handed on in the same draw as isv_<name> (Safelight 3.0.1); without
+  // a producer the stage assigns them in its glsl.
+  produces?: InterStageVariable[];
+  // Runs the stage again inside each mask whose bag holds its keys, with that
+  // mask's values, blended by its coverage (Safelight 3.1.0, process version 2
+  // photos).
+  mask?: { maskable: true };
   // Omitted, a display-phase stage is handed `c` clipped to [0, 1] on process
   // version 2, the clip written ahead of its block and outside its own gate.
   // Hosts before process versions ignore it.
@@ -74,6 +87,16 @@ interface PipelineContribution {
   skipToneShoulder?: boolean;
 }
 
+// The params a panel edits: the photo's bag, or one mask's (maskId set).
+// Reads see the store as it is now, not as the render was handed it.
+interface ParamScope {
+  maskId: string | null;
+  getParam(key: string): unknown;
+  getParams(): Readonly<Record<string, unknown>>;
+  setParams(patch: Record<string, unknown>): void;
+  commit(label: string): void;
+}
+
 interface SafelightAPI {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   react: any;
@@ -88,6 +111,10 @@ interface SafelightAPI {
     component: any;
     defaultDock?: { module: "library" | "develop"; direction: "left" | "right"; order?: number; width?: number };
     onReset?: () => void;
+    // Offers the panel in a mask's Adjust tab, editing that mask's values
+    // through useParamScope; `owns` lists every qualified key it writes.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mask?: { component: any; order?: number; owns: readonly string[] };
   }): void;
   settings: {
     get<T>(key: string, fallback: T): T;
@@ -97,6 +124,10 @@ interface SafelightAPI {
   components: Record<string, any>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   stores: Record<string, any>;
+  develop: {
+    // The mask's scope inside a mask's Adjust tab, the photo's anywhere else.
+    useParamScope(): ParamScope;
+  };
 }
 
 // ─── Stage ───────────────────────────────────────────────────────────────────
@@ -136,7 +167,7 @@ const vec3lit = (v: readonly [number, number, number]) =>
 // only the Contrast label changes (it targets the film curve on a slide).
 const isSlide = (stock: FilmStockData) => stock.kind === "slide";
 
-function buildStage(stock: FilmStockData): ProcessingStageContribution {
+export function buildStage(stock: FilmStockData): ProcessingStageContribution {
   const slide = isSlide(stock);
   const uniforms: UniformDeclaration[] = [
     { key: "sfExposure", glslType: "float", default: 0, range: { min: -3, max: 3, step: 0.01 }, label: "Exposure" },
@@ -168,6 +199,15 @@ function buildStage(stock: FilmStockData): ProcessingStageContribution {
     // intended behaviour. Live params stay uniforms.
     helpers: FILM_HELPERS,
     glsl: stock.consts + "\n" + FILM_GLSL,
+    // The scene and settings a mask's copy develops again (see FILM_GLSL).
+    produces: [
+      { name: "spektrafilmScene", glslType: "vec4" },
+      { name: "spektrafilmLive", glslType: "vec4" },
+      { name: "spektrafilmFilt", glslType: "vec2" },
+    ],
+    // A mask's copy shares this stage's spectral textures and baked constants,
+    // so a mask changes the photo's stock's settings, never the stock.
+    mask: { maskable: true },
   };
 }
 
@@ -533,13 +573,19 @@ export function activate(api: SafelightAPI): void {
     skipToneShoulder: true,
   });
 
+  // The panel edits whatever useParamScope hands it: the photo's bag in the
+  // dock, a mask's in the Masking panel's Adjust tab. The stock is always the
+  // photo's, and Halation and Grain stay the photo's, so a mask's panel has the
+  // film controls only, which develop the photo's stock again with the mask's
+  // settings on top of the photo's.
   function SpektrafilmPanel() {
     const Slider = api.components.Slider;
     const useDevelopStore = api.stores.useDevelopStore;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const paramBag: Record<string, unknown> = useDevelopStore((s: any) => s.paramBag);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const setDynParam: (k: string, v: number) => void = useDevelopStore((s: any) => s.setDynParam);
+    const scope = api.develop.useParamScope();
+    const inMask = scope.maskId !== null;
+    const values = scope.getParams();
     // Section open/closed state (Film open; effects collapsed since they're off by
     // default). One object so the number of hooks stays constant — no per-section
     // useState in a loop.
@@ -560,16 +606,16 @@ export function activate(api: SafelightAPI): void {
     const h = React.createElement;
     // Persist on gesture end (mirrors core panels): setDynParam only mutates the
     // in-memory bag, so without committing the values reset on a library round-trip.
-    const commit = () => { void useDevelopStore.getState().commitEdit("Spektrafilm"); };
+    const commit = () => scope.commit("Spektrafilm");
     const valOf = (c: Ctrl): number => {
-      const v = paramBag[`${c.stage}.${c.key}`];
+      const v = values[`${c.stage}.${c.key}`];
       return typeof v === "number" ? v : c.dflt;
     };
     const renderCtrl = (c: Ctrl) =>
       h(Slider, {
         key: c.key, label: c.label, value: valOf(c), min: c.min, max: c.max, step: c.step,
         defaultValue: c.dflt,
-        onChange: (v: number) => setDynParam(`${c.stage}.${c.key}`, v),
+        onChange: (v: number) => scope.setParams({ [`${c.stage}.${c.key}`]: v }),
         onCommit: commit,
       });
     // Has any control in the section moved off its default? Drives the per-section
@@ -577,9 +623,7 @@ export function activate(api: SafelightAPI): void {
     const sectionDirty = (sec: PanelSection) =>
       sec.ctrls.some((c) => valOf(c) !== c.dflt);
     const resetSection = (sec: PanelSection) => {
-      useDevelopStore.getState().setDynParams(
-        Object.fromEntries(sec.ctrls.map((c) => [`${c.stage}.${c.key}`, c.dflt])),
-      );
+      scope.setParams(Object.fromEntries(sec.ctrls.map((c) => [`${c.stage}.${c.key}`, c.dflt])));
       commit();
     };
 
@@ -615,6 +659,19 @@ export function activate(api: SafelightAPI): void {
     const activeStock = FILM_STOCKS.find((s) => s.id === stock) ?? FILM_STOCKS[0];
     const isNone = stock === NONE_ID;
     const sections = sectionsFor(activeStock.kind);
+    const note = (text: string) =>
+      h("p", { className: "text-[11px] text-text-secondary", style: { lineHeight: 1.35, margin: "2px 0 4px" } }, text);
+
+    if (inMask) {
+      return h(
+        "div",
+        { className: "flex flex-col gap-1.5 p-2" },
+        isNone
+          ? note("This photo has no film stock yet. Choose one in the Spektrafilm panel, then shape it here.")
+          : note(`Develops the photo's ${activeStock.name} again inside the mask, these settings on top of the photo's. At their defaults the mask matches the photo.`),
+        isNone ? null : renderSection(sections[0]),
+      );
+    }
 
     return h(
       "div",
@@ -654,6 +711,9 @@ export function activate(api: SafelightAPI): void {
     component: SpektrafilmPanel,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
     onReset: () => resetPanel(api),
+    // The same panel edits a mask's film settings in the Masking panel's
+    // Adjust tab. Every stock's controls are a subset of the negative's.
+    mask: { component: SpektrafilmPanel, owns: FILM_CTRLS_NEG.map((c) => `${c.stage}.${c.key}`) },
   });
 }
 

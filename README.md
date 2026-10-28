@@ -67,6 +67,14 @@ Per-stock, all live (no re-bake):
   tinted by the stock's own anti-halation balance, resolution-independent.
 - **Grain** (Amount / Size) — midtone-peaked, per-channel film grain at the
   stock's grain character, resolution-independent (monochrome for B&W stocks).
+- **In masks:** add Spektrafilm to a mask from the Masking panel's Adjust tab
+  to develop the photo's stock again inside that mask with different film
+  settings, such as dodging and burning the print or local filtration. The
+  mask's settings go on top of the photo's: Exposure and Filtration add, Print
+  Exposure, Coupler Amount and Contrast multiply, so at their defaults the mask
+  matches the photo. The mask uses the photo's stock and has no stock picker,
+  Halation or Grain, which stay the photo's. It needs the current processing:
+  on a photo edited in an earlier Safelight, use Update processing first.
 
 Halation and grain default to 0 (off) until dialled in. The control set follows
 the stock: **slides** drop Print Exposure / filtration (no enlarger) and expose a
@@ -188,11 +196,13 @@ repo URL into the panel.
 npm install
 npm run build      # → dist/index.js   (commit this — installs load the prebuilt bundle)
 npm run typecheck  # tsc --noEmit
-npm run test:gpu   # grain spec on a real WebGL2 driver, via a SafeLight checkout's rig
+npm test           # the mask contract: the film stage and the panel, on the CPU
+npm run test:gpu   # grain, effects at rest and the film in a mask, on a real WebGL2 driver via a SafeLight checkout's rig
 ```
 
 Requires the host's **rgba16f stage-texture API** (`api.setStageTexture` with
-float textures) — hence `minAppVersion`.
+float textures) and, for masks, its per-mask stage copies (Safelight 3.1.0) —
+hence `minAppVersion`.
 
 ## Licensing
 
