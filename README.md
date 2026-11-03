@@ -180,7 +180,9 @@ install/reload.
   models. Halation is an inline mip-chain bloom of the source highlights (Size =
   blur LOD), screen-blended and tinted to the stock's anti-halation balance
   (neutral for B&W); grain is binomial-statistics noise peaking in the midtones.
-  Both run inline in the effects phase.
+  Both run inline in the effects phase. Photos on process version 1 keep the
+  look they were edited with: the halo's level is Size at any render size, and
+  both effects hold the image to [0, 1]. Needs SafeLight 3.2.0 or later.
 - **Black & white** stocks are datasheet-*shaped* parametric models, not measured
   spectral data, and use a single normal-grade paper: grade/contrast is the Paper
   Grade control, not true variable-contrast (two-emulsion) filtration.

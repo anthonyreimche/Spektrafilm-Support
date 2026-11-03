@@ -23,26 +23,25 @@ import {
   withRenderer,
   type Frame,
 } from "@/rendering/webgl/webgl.test-support";
-import { buildStage } from "@sf/index";
+import { buildAtlases, buildStage } from "@sf/index";
 import { FILM_STOCKS } from "@sf/stocks_data.generated";
 
 const W = 256;
 const H = 48;
 const FILM = "spektrafilm-support.film";
-const STOCK = FILM_STOCKS.find((s) => s.kind === "negative")!;
+const NEGATIVE = FILM_STOCKS.findIndex((s) => s.kind === "negative");
 
 // The spectral table marks opaque bins with a base density of 1e6, past
-// binary16's largest value, so the upload stores infinity; SwiftShader's
-// linear filter turns a zero weight on it into NaN and the film renders
-// black. Any density in the thousands transmits exactly nothing in float32,
-// so the rig stores binary16's largest value there instead: the same film.
+// binary16's largest value, so the upload stores infinity. Any density in the
+// thousands transmits exactly nothing in float32, so the rig stores binary16's
+// largest value there instead: the same film.
 const HALF_MAX = 65504;
-const filmSpec = STOCK.filmSpec().map((v) => Math.min(v, HALF_MAX));
+const ATLASES = buildAtlases(FILM_STOCKS);
 
 const TEXTURES = {
-  [`${FILM}.filmTc`]: { data: STOCK.filmTc(), width: STOCK.tcSize, height: STOCK.tcSize, format: "rgba16f" as const, version: 1 },
-  [`${FILM}.filmCurves`]: { data: STOCK.filmCurves(), width: 256, height: 3, format: "rgba16f" as const, version: 1 },
-  [`${FILM}.filmSpec`]: { data: filmSpec, width: 81, height: 4, format: "rgba16f" as const, version: 1 },
+  [`${FILM}.filmTc`]: { ...ATLASES.filmTc, version: 1 },
+  [`${FILM}.filmCurves`]: { ...ATLASES.filmCurves, version: 1 },
+  [`${FILM}.filmSpec`]: { ...ATLASES.filmSpec, data: ATLASES.filmSpec.data.map((v) => Math.min(v, HALF_MAX)), version: 1 },
 };
 
 /** A hue sweep by column over three brightness bands, in scene-linear light. */
@@ -67,6 +66,8 @@ type Settings = Record<"sfExposure" | "sfPrintExp" | "sfCouplerAmt" | "sfContras
 
 const bag = (s: Settings): Record<string, number> =>
   Object.fromEntries(Object.entries(s).map(([k, v]) => [`${FILM}.${k}`, v]));
+// The photo's stock. A mask's bag never holds it, so its copy develops the photo's.
+const photoBag = (s: Settings): Record<string, number> => ({ ...bag(s), [`${FILM}.sfStock`]: NEGATIVE });
 
 const PHOTO: Settings = { sfExposure: 0.25, sfPrintExp: 1.25, sfCouplerAmt: 0.75, sfContrast: 1, sfFiltM: 5, sfFiltY: -4 };
 const MASK: Settings = { sfExposure: 0.75, sfPrintExp: 0.75, sfCouplerAmt: 1.25, sfContrast: 1.25, sfFiltM: 10, sfFiltY: 8 };
@@ -94,12 +95,12 @@ const right = (x: number) => x > W / 2 + 2;
 /** Frames in sequence on one renderer: renderers share one context, and a
  *  nested one's dispose() tears down GL state the outer one relies on. */
 function frames(runs: { photo: Settings; masks: Mask[] }[]): Frame[] {
-  const stages = [...builtinStages(), buildStage(STOCK) as ProcessingStageContribution];
+  const stages = [...builtinStages(), buildStage() as ProcessingStageContribution];
   return withRenderer({ stages, pipeline: LINEAR_PROBE_PIPELINE }, (r) => {
     r.setImage(SCENE);
     r.setStageTextures(TEXTURES);
     return runs.map(({ photo, masks }) => {
-      r.setContributedParams(bag(photo));
+      r.setContributedParams(photoBag(photo));
       r.setParams(identityParams({ processVersion: 2, masks }));
       const f = r.captureFloatFrame();
       if (!f) throw new Error("captureFloatFrame returned null");

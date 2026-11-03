@@ -10,7 +10,8 @@
 // program, and the rendered grain through the real renderer.
 
 import { describe, expect, it } from "vitest";
-import { buildGrainStage } from "@sf/index";
+import type { ProcessingStageContribution } from "@/extensions/types";
+import { buildAtlases, buildGrainStage, buildStage } from "@sf/index";
 import { FILM_STOCKS } from "@sf/stocks_data.generated";
 import {
   LINEAR_PROBE_PIPELINE,
@@ -23,7 +24,9 @@ import {
   withRenderer,
 } from "@/rendering/webgl/webgl.test-support";
 
-const FX = FILM_STOCKS[0].fx;
+const FILM = "spektrafilm-support.film";
+// The opaque spectral bins' density as the rig stores it (film-mask.webgl.test.ts).
+const HALF_MAX = 65504;
 
 /** Largest |normalised autocorrelation| of a row-major field over lags in
  *  [-maxLag, maxLag]², skipping lags whose Chebyshev distance is below
@@ -79,7 +82,7 @@ in vec2 aPos;
 void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
     const fragment = `#version 300 es
 precision highp float;
-${buildGrainStage(FX).helpers}
+${buildGrainStage().helpers}
 uniform vec2 uOrigin;
 out vec4 fragColor;
 void main() {
@@ -153,15 +156,25 @@ void main() {
     const W = 768;
     const H = 512;
     const grey = floatImage(W, H, () => [0.5, 0.5, 0.5]);
-    const stage = buildGrainStage(FX);
+    // Grain follows the photo's stock, which the film stage hands on.
+    const stage = buildGrainStage();
+    const film = buildStage() as ProcessingStageContribution;
+    const atlases = buildAtlases(FILM_STOCKS);
+    const stock = { [`${FILM}.sfStock`]: 0 };
     const frames = withRenderer(
-      { stages: [...builtinStages(), stage], pipeline: LINEAR_PROBE_PIPELINE },
+      { stages: [...builtinStages(), film, stage as ProcessingStageContribution], pipeline: LINEAR_PROBE_PIPELINE },
       (renderer) => {
         renderer.setImage(grey);
+        renderer.setStageTextures({
+          [`${FILM}.filmTc`]: { ...atlases.filmTc, version: 1 },
+          [`${FILM}.filmCurves`]: { ...atlases.filmCurves, version: 1 },
+          [`${FILM}.filmSpec`]: { ...atlases.filmSpec, data: atlases.filmSpec.data.map((v) => Math.min(v, HALF_MAX)), version: 1 },
+        });
         renderer.setParams(identityParams());
-        renderer.setContributedParams({});
+        renderer.setContributedParams(stock);
         const off = renderer.captureFloatFrame();
         renderer.setContributedParams({
+          ...stock,
           [`${stage.id}.sfGrainAmount`]: 0.5,
           [`${stage.id}.sfGrainSize`]: 5,
         });
