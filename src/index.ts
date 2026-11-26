@@ -161,6 +161,8 @@ interface SafelightAPI {
     title: string;
     component: Component<Record<string, never>>;
     defaultDock?: { module: "library" | "develop"; direction: "left" | "right"; order?: number; width?: number };
+    /** The modules the panel may be docked in; omitted, every module (Safelight 3.2.8). */
+    modules?: readonly string[];
     onReset?: () => void;
     // Offers the panel in a mask's Adjust tab, editing that mask's values
     // through useParamScope; `owns` lists every qualified key it writes.
@@ -825,6 +827,7 @@ export function activate(api: SafelightAPI): void {
     title: "Spektrafilm",
     component: SpektrafilmPanel,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
+    modules: ["develop"],
     onReset: () => resetPanel(api),
     // The same panel edits a mask's film settings in the Masking panel's
     // Adjust tab. Every stock's controls are a subset of the negative's.

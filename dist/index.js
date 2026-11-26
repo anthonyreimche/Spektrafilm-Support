@@ -1317,6 +1317,7 @@ function GA(Q) {
     title: "Spektrafilm",
     component: B,
     defaultDock: { module: "develop", direction: "right", order: 6, width: 260 },
+    modules: ["develop"],
     onReset: () => qA(Q),
     // The same panel edits a mask's film settings in the Masking panel's
     // Adjust tab. Every stock's controls are a subset of the negative's.
